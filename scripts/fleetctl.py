@@ -290,16 +290,21 @@ def collect(host_name: str) -> dict[str, Any]:
     fleet = load_toml(FLEET_CONFIG)
     host_path = FLEET_DIR / "hosts" / f"{host_name}.toml"
     host = load_toml(host_path)
+    bin_root = Path(host["bin_root"]).resolve()
     runtime_root = Path(host["runtime_root"]).resolve()
     components: dict[str, Any] = {}
 
     for name, component in fleet.get("components", {}).items():
         kind = component["kind"]
-        install_dir = runtime_root / component.get("install_dir", name)
-        binary_path = install_dir / component["binary"]
-        if kind == "upstream_release":
-            versioned_binary = install_dir / "current" / component["binary"]
-            binary_path = versioned_binary if versioned_binary.exists() else binary_path
+        if kind == "git":
+            install_dir = bin_root
+            binary_path = bin_root / component["binary"]
+        else:
+            install_dir = runtime_root / component.get("install_dir", name)
+            binary_path = install_dir / component["binary"]
+            if kind == "upstream_release":
+                versioned_binary = install_dir / "current" / component["binary"]
+                binary_path = versioned_binary if versioned_binary.exists() else binary_path
         entry: dict[str, Any] = {
             "kind": kind,
             "required": bool(component.get("required", False)),
@@ -332,6 +337,7 @@ def collect(host_name: str) -> dict[str, Any]:
         "host_id": host["host_id"],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_root": host.get("source_root"),
+        "bin_root": str(bin_root),
         "runtime_root": str(runtime_root),
         "policy": fleet.get("policy", {}),
         "components": components,
@@ -392,7 +398,7 @@ def yaml_string(value: str) -> str:
 
 def render_server(name: str, server: dict[str, Any], host: dict[str, Any], fleet: dict[str, Any]) -> str:
     component = fleet["components"][name]
-    command = Path(host["runtime_root"]) / component.get("install_dir", name) / component["binary"]
+    command = Path(host["bin_root"]) / component["binary"]
     args = ["--root", host["workspace_root"]]
     args.extend(server.get("extra_args", []))
     lines = [
@@ -423,7 +429,7 @@ def render_server(name: str, server: dict[str, Any], host: dict[str, Any], fleet
 def gateway_outputs(host_name: str) -> dict[Path, str]:
     fleet = load_toml(FLEET_CONFIG)
     host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
-    server_dir = (FLEET_DIR / host["gateway"]["server_dir"]).resolve()
+    server_dir = (Path(host["runtime_root"]) / host["gateway"]["server_dir"]).resolve()
     outputs: dict[Path, str] = {}
     for name in ("filesystem", "git", "exec"):
         outputs[server_dir / f"{name}.yaml"] = render_server(name, host["servers"][name], host, fleet)
@@ -472,6 +478,7 @@ def toml_array(values: list[str]) -> str:
 
 
 def studio_config_text(host: dict[str, Any]) -> str:
+    bin_root = Path(host["bin_root"]).resolve()
     runtime_root = Path(host["runtime_root"]).resolve()
     workspace_root = host["workspace_root"]
     lines = [
@@ -483,7 +490,7 @@ def studio_config_text(host: dict[str, Any]) -> str:
         "",
         "[registry]",
         f"path = {toml_string(str(runtime_root / 'studio' / 'data' / 'registry.toml'))}",
-        f"mcp_root = {toml_string(str(runtime_root))}",
+        f"mcp_root = {toml_string(str(bin_root))}",
         "",
         "[tunnel]",
         "name = \"Secure tunnel\"",
@@ -501,8 +508,8 @@ def studio_config_text(host: dict[str, Any]) -> str:
         lines.extend([
             f"[mcp.{name}]",
             f"name = {toml_string(display_names[name])}",
-            f"command = {toml_string(str(runtime_root / name / binary_names[name]))}",
-            f"working_dir = {toml_string(str(runtime_root / name))}",
+            f"command = {toml_string(str(bin_root / binary_names[name]))}",
+            f"working_dir = {toml_string(str(bin_root))}",
             f"args = {toml_array(args)}",
         ])
         env = server.get("env", {})
@@ -541,8 +548,9 @@ def render_studio(host_name: str, check: bool) -> int:
 
 
 def tunnel_config_text(host: dict[str, Any]) -> str:
+    bin_root = Path(host["bin_root"]).resolve()
     runtime_root = Path(host["runtime_root"]).resolve()
-    gateway = runtime_root / "gateway" / "rust-mcp-gateway"
+    gateway = bin_root / "rust-mcp-gateway"
     server_dir = runtime_root / "gateway" / "servers.d"
     lines = [
         "config_version: 1", "",
@@ -616,7 +624,7 @@ def install_component(host_name: str, component_name: str) -> int:
     if not source.is_file():
         print(f"fleetctl: build output is missing: {source}", file=sys.stderr)
         return 2
-    install_dir = Path(host["runtime_root"]).resolve() / component.get("install_dir", component_name)
+    install_dir = Path(host["bin_root"]).resolve()
     install_dir.mkdir(parents=True, exist_ok=True)
     destination = install_dir / component["binary"]
     fd, temp_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=install_dir)

@@ -12,7 +12,7 @@ Current Phase 1 responsibilities:
 - keep host-local absolute paths in `hosts/<host>.toml`;
 - render Gateway `servers.d/*.yaml` deterministically from the host profile;
 - report Git commit/branch/dirty/remote state for every source component;
-- keep source checkouts under `mcp-server/src/*` and installed runtimes under `mcp-server/bin/*`;
+- keep project source checkouts directly under `mcp-server/<project>`; keep only flat Rust MCP executables in `mcp-server/bin`; keep non-MCP runtime/config/state under `mcp-server/runtime`;
 - report tunnel bundle version without copying `config.yaml` into source control;
 - emit a local JSON snapshot under `state/` for later Studio integration.
 
@@ -73,26 +73,29 @@ mcp-server/bin/tunnel-client/
 
 ## Source/runtime separation
 
-Development hosts may contain both `mcp-server/src` and `mcp-server/bin`. Runtime-only hosts may omit source checkouts entirely and install only versioned release artifacts under `mcp-server/bin`. Gateway and Studio runtime configuration must reference `bin`, never `target/release` directly.
+Projects live directly under `mcp-server/<project>`. `mcp-server/bin` is reserved for flat Rust MCP executables only; non-MCP runtime/config/state lives under `mcp-server/runtime`. Gateway and Studio must execute Rust MCPs from `bin`, never `target/release` directly.
 
 Project-owned source repositories are hosted under the private GitHub organization `13thx-mcp`. `tunnel-client` is the exception: it tracks the official `openai/tunnel-client` releases directly.
 
 ## Runtime-only control bundle
 
-`deploy-control` copies the fleet manifest, the selected host profile, documentation, and `fleetctl.py` into `mcp-server/bin/fleet`. The deployed copy resolves source repositories from `host.source_root` instead of assuming it lives beside source checkouts. This allows `bin/fleet` to run `status`, `doctor`, `render-*`, and official tunnel release checks/updates on hosts where `mcp-server/src` is absent. Source-build/install commands naturally require the corresponding source checkout.
+`deploy-control` copies the fleet manifest, selected host profile, documentation, and `fleetctl.py` into `mcp-server/runtime/fleet`. Source repositories are resolved from `host.source_root`; Rust MCP binaries are installed into the flat `host.bin_root`; generated operational state remains under `host.runtime_root`.
 
 Runtime configuration is generated outside source repositories:
 
 ```text
-mcp-server/bin/
-├── fleet/
-├── gateway/
-│   └── servers.d/
-├── studio/
-│   ├── studio.toml
-│   └── data/registry.toml
-└── tunnel-client/
-    ├── config.yaml
-    ├── current -> releases/vX.Y.Z
-    └── releases/
+mcp-server/
+├── bin/
+│   ├── rust-mcp-filesystem
+│   ├── rust-mcp-git
+│   ├── rust-mcp-exec
+│   └── rust-mcp-gateway
+└── runtime/
+    ├── fleet/
+    ├── gateway/servers.d/
+    ├── studio/
+    └── tunnel-client/
+        ├── config.yaml
+        ├── current -> releases/vX.Y.Z
+        └── releases/
 ```

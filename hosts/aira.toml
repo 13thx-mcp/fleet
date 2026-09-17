@@ -1,11 +1,12 @@
 schema_version = 1
 host_id = "aira"
 workspace_root = "/Users/xiivth/workspaces/signs"
-source_root = "/Users/xiivth/workspaces/signs/mcp-server/src"
-runtime_root = "/Users/xiivth/workspaces/signs/mcp-server/bin"
+source_root = "/Users/xiivth/workspaces/signs/mcp-server"
+bin_root = "/Users/xiivth/workspaces/signs/mcp-server/bin"
+runtime_root = "/Users/xiivth/workspaces/signs/mcp-server/runtime"
 
 [gateway]
-server_dir = "../../bin/gateway/servers.d"
+server_dir = "gateway/servers.d"
 
 [servers.filesystem]
 enabled = true
