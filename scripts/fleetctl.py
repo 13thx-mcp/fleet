@@ -36,6 +36,16 @@ def component_path(component: dict[str, Any], host: dict[str, Any]) -> Path:
     return (Path(host["source_root"]) / component["source_dir"]).resolve()
 
 
+def component_install_dir(name: str, component: dict[str, Any], host: dict[str, Any]) -> Path:
+    default_scope = "bin" if component.get("kind") == "git" else "runtime"
+    scope = component.get("install_scope", default_scope)
+    if scope == "bin":
+        return Path(host["bin_root"]).resolve()
+    if scope == "runtime":
+        return Path(host["runtime_root"]).resolve() / component.get("install_dir", name)
+    raise RuntimeError(f"unsupported install_scope for {name}: {scope}")
+
+
 def cargo_version(path: Path) -> str | None:
     manifest = path / "Cargo.toml"
     if not manifest.is_file():
@@ -296,15 +306,11 @@ def collect(host_name: str) -> dict[str, Any]:
 
     for name, component in fleet.get("components", {}).items():
         kind = component["kind"]
-        if kind == "git":
-            install_dir = bin_root
-            binary_path = bin_root / component["binary"]
-        else:
-            install_dir = runtime_root / component.get("install_dir", name)
-            binary_path = install_dir / component["binary"]
-            if kind == "upstream_release":
-                versioned_binary = install_dir / "current" / component["binary"]
-                binary_path = versioned_binary if versioned_binary.exists() else binary_path
+        install_dir = component_install_dir(name, component, host)
+        binary_path = install_dir / component["binary"]
+        if kind == "upstream_release":
+            versioned_binary = install_dir / "current" / component["binary"]
+            binary_path = versioned_binary if versioned_binary.exists() else binary_path
         entry: dict[str, Any] = {
             "kind": kind,
             "required": bool(component.get("required", False)),
@@ -624,7 +630,7 @@ def install_component(host_name: str, component_name: str) -> int:
     if not source.is_file():
         print(f"fleetctl: build output is missing: {source}", file=sys.stderr)
         return 2
-    install_dir = Path(host["bin_root"]).resolve()
+    install_dir = component_install_dir(component_name, component, host)
     install_dir.mkdir(parents=True, exist_ok=True)
     destination = install_dir / component["binary"]
     fd, temp_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=install_dir)

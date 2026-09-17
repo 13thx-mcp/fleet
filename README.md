@@ -79,7 +79,7 @@ Project-owned source repositories are hosted under the private GitHub organizati
 
 ## Runtime-only control bundle
 
-`deploy-control` copies the fleet manifest, selected host profile, documentation, and `fleetctl.py` into `mcp-server/runtime/fleet`. Source repositories are resolved from `host.source_root`; Rust MCP binaries are installed into the flat `host.bin_root`; generated operational state remains under `host.runtime_root`.
+`deploy-control` copies the fleet manifest, selected host profile, documentation, and `fleetctl.py` into `mcp-server/runtime/fleet`. Source repositories are resolved from `host.source_root`; Rust MCP binaries are installed into the flat `host.bin_root`; non-MCP services such as Studio use `install_scope = "runtime"` and install beneath `host.runtime_root`. Generated operational state remains under `host.runtime_root`.
 
 Runtime configuration is generated outside source repositories:
 

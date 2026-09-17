@@ -53,6 +53,8 @@ test = ["cargo", "test", "--all-targets", "--all-features"]
 
 [components.studio]
 kind = "git"
+install_scope = "runtime"
+install_dir = "studio"
 source_dir = "studio"
 repository = "https://github.com/13thx-mcp/studio.git"
 package = "mcp-studio"
