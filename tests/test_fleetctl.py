@@ -48,8 +48,9 @@ class FleetCtlTests(unittest.TestCase):
     def test_generated_runtime_configs_use_bin_paths(self) -> None:
         host = {
             "workspace_root": "/work",
-            "source_root": "/work/mcp-server/src",
-            "runtime_root": "/work/mcp-server/bin",
+            "source_root": "/work/mcp-server",
+            "bin_root": "/work/mcp-server/bin",
+            "runtime_root": "/work/mcp-server/runtime",
             "servers": {
                 "filesystem": {},
                 "git": {"extra_args": ["--allow-remote-read"]},
@@ -57,18 +58,18 @@ class FleetCtlTests(unittest.TestCase):
             },
         }
         studio = fleetctl.studio_config_text(host)
-        self.assertIn('/work/mcp-server/bin/filesystem/rust-mcp-filesystem', studio)
-        self.assertIn('/work/mcp-server/bin/tunnel-client/current/tunnel-client-runtime-cloudflared', studio)
+        self.assertIn('/work/mcp-server/bin/rust-mcp-filesystem', studio)
+        self.assertIn('/work/mcp-server/runtime/tunnel-client/current/tunnel-client-runtime-cloudflared', studio)
         self.assertNotIn('/target/release/', studio)
         tunnel = fleetctl.tunnel_config_text(host)
-        self.assertIn('/work/mcp-server/bin/gateway/rust-mcp-gateway', tunnel)
-        self.assertIn('/work/mcp-server/bin/gateway/servers.d', tunnel)
+        self.assertIn('/work/mcp-server/bin/rust-mcp-gateway', tunnel)
+        self.assertIn('/work/mcp-server/runtime/gateway/servers.d', tunnel)
         self.assertNotIn('/mcp-server/src/', tunnel)
 
     def test_component_path_uses_host_source_root(self) -> None:
-        host = {"source_root": "/work/mcp-server/src"}
+        host = {"source_root": "/work/mcp-server"}
         component = {"source_dir": "gateway"}
-        self.assertEqual(fleetctl.component_path(component, host), Path('/work/mcp-server/src/gateway'))
+        self.assertEqual(fleetctl.component_path(component, host), Path('/work/mcp-server/gateway'))
 
 
 if __name__ == "__main__":
