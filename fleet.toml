@@ -1,0 +1,61 @@
+schema_version = 1
+fleet_name = "mcp-local-dev"
+
+[policy]
+update_mode = "manual"
+require_clean_tree = true
+require_fast_forward = true
+build_profile = "release"
+
+[components.filesystem]
+kind = "git"
+path = "../filesystem"
+package = "rust-mcp-filesystem"
+binary = "target/release/rust-mcp-filesystem"
+required = true
+build = ["cargo", "build", "--release", "--locked"]
+test = ["cargo", "test", "--all-targets", "--all-features"]
+
+[components.git]
+kind = "git"
+path = "../git"
+package = "rust-mcp-git"
+binary = "target/release/rust-mcp-git"
+required = true
+build = ["cargo", "build", "--release", "--locked"]
+test = ["cargo", "test", "--all-targets", "--all-features"]
+
+[components.exec]
+kind = "git"
+path = "../exec"
+package = "rust-mcp-exec"
+binary = "target/release/rust-mcp-exec"
+required = true
+build = ["cargo", "build", "--release", "--locked"]
+test = ["cargo", "test", "--all-targets", "--all-features"]
+
+[components.gateway]
+kind = "git"
+path = "../gateway"
+package = "rust-mcp-gateway"
+binary = "target/release/rust-mcp-gateway"
+required = true
+build = ["cargo", "build", "--release", "--locked"]
+test = ["cargo", "test", "--all-targets", "--all-features"]
+
+[components.studio]
+kind = "git"
+path = "../studio"
+package = "mcp-studio"
+binary = "target/release/mcp-studio"
+required = true
+build = ["cargo", "build", "--release", "--locked"]
+test = ["cargo", "test", "--all-targets", "--all-features"]
+
+[components.tunnel-client]
+kind = "bundle"
+path = "../tunnel-client"
+binary = "tunnel-client-runtime-cloudflared"
+manifest = "cloudflared-manifest.json"
+local_config = "config.yaml"
+required = true
