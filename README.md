@@ -8,11 +8,12 @@ This directory is the control-plane source for **desired component identity and 
 
 Current Phase 1 responsibilities:
 
-- declare required MCP components and their build/test commands in `fleet.toml`;
+- declare required MCP components, GitHub repositories, build outputs, and installed runtime binary names in `fleet.toml`;
 - keep host-local absolute paths in `hosts/<host>.toml`;
 - render Gateway `servers.d/*.yaml` deterministically from the host profile;
 - report Git commit/branch/dirty/remote state for every source component;
-- report tunnel bundle version without copying the runtime binary or `config.yaml`;
+- keep source checkouts under `mcp-server/src/*` and installed runtimes under `mcp-server/bin/*`;
+- report tunnel bundle version without copying `config.yaml` into source control;
 - emit a local JSON snapshot under `state/` for later Studio integration.
 
 Automatic pull/build/restart remains disabled until every source component has a configured remote and a clean fast-forward-only update path.
@@ -20,11 +21,14 @@ Automatic pull/build/restart remains disabled until every source component has a
 ## Commands
 
 ```bash
-cd mcp-server/fleet
+cd mcp-server/src/fleet
 python3 scripts/fleetctl.py status --host aira
 python3 scripts/fleetctl.py doctor --host aira
 python3 scripts/fleetctl.py render-gateway --host aira --check
 python3 scripts/fleetctl.py render-gateway --host aira
+python3 scripts/fleetctl.py install --host aira --component filesystem
+python3 scripts/fleetctl.py tunnel-check --host aira
+python3 scripts/fleetctl.py tunnel-update --host aira
 python3 scripts/fleetctl.py snapshot --host aira
 ```
 
@@ -44,4 +48,28 @@ Do not commit:
 - PID/socket/log files;
 - generated `fleet/state/*` snapshots.
 
-The tunnel runtime is represented by its checked manifest/version, not by copying the 58 MB local bundle into this fleet repo.
+## Official tunnel-client updates
+
+`tunnel-client` is not forked or rebuilt by this fleet. Its source of truth is the official OpenAI repository and GitHub Releases:
+
+- repository: `https://github.com/openai/tunnel-client`
+- release API: `https://api.github.com/repos/openai/tunnel-client/releases/latest`
+- selected artifact: `tunnel-client-runtime-cloudflared-v<version>-<os>-<arch>.zip`
+
+`tunnel-check` detects the local OS/architecture and compares the installed binary's `--version` against the latest official release. `tunnel-update` downloads the matching official asset plus `SHA256SUMS.txt`, verifies SHA-256, validates the extracted binary version, installs it under `bin/tunnel-client/releases/v<version>`, and atomically repoints `bin/tunnel-client/current`. The host-local `config.yaml` is outside the release directory and is never overwritten.
+
+The installed layout is:
+
+```text
+mcp-server/bin/tunnel-client/
+├── config.yaml          # host-local, never overwritten
+├── current -> releases/vX.Y.Z
+└── releases/
+    └── vX.Y.Z/          # verified official release contents
+```
+
+## Source/runtime separation
+
+Development hosts may contain both `mcp-server/src` and `mcp-server/bin`. Runtime-only hosts may omit source checkouts entirely and install only versioned release artifacts under `mcp-server/bin`. Gateway and Studio runtime configuration must reference `bin`, never `target/release` directly.
+
+Project-owned source repositories are hosted under the private GitHub organization `13thx-mcp`. `tunnel-client` is the exception: it tracks the official `openai/tunnel-client` releases directly.

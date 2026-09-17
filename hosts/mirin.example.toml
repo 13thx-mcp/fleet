@@ -1,10 +1,11 @@
 schema_version = 1
 host_id = "mirin"
 workspace_root = "/REPLACE/WITH/MIRIN/WORKSPACE"
-mcp_root = "/REPLACE/WITH/MIRIN/WORKSPACE/mcp-server"
+source_root = "/REPLACE/WITH/MIRIN/WORKSPACE/mcp-server/src"
+runtime_root = "/REPLACE/WITH/MIRIN/WORKSPACE/mcp-server/bin"
 
 [gateway]
-server_dir = "../gateway/servers.d"
+server_dir = "../../bin/gateway/servers.d"
 
 [servers.filesystem]
 enabled = true
