@@ -32,8 +32,8 @@ def run(argv: list[str], cwd: Path) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
-def component_path(component: dict[str, Any]) -> Path:
-    return (FLEET_DIR / component["path"]).resolve()
+def component_path(component: dict[str, Any], host: dict[str, Any]) -> Path:
+    return (Path(host["source_root"]) / component["source_dir"]).resolve()
 
 
 def cargo_version(path: Path) -> str | None:
@@ -309,7 +309,7 @@ def collect(host_name: str) -> dict[str, Any]:
             "binary_exists": binary_path.is_file(),
         }
         if kind == "git":
-            path = component_path(component)
+            path = component_path(component, host)
             entry["path"] = str(path)
             entry["source_exists"] = path.is_dir()
             build_output = component.get("build_output")
@@ -463,6 +463,145 @@ def render_gateway(host_name: str, check: bool) -> int:
     return 0
 
 
+def toml_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def toml_array(values: list[str]) -> str:
+    return "[" + ", ".join(toml_string(value) for value in values) + "]"
+
+
+def studio_config_text(host: dict[str, Any]) -> str:
+    runtime_root = Path(host["runtime_root"]).resolve()
+    workspace_root = host["workspace_root"]
+    lines = [
+        "log_capacity = 500",
+        "stop_timeout_ms = 3000",
+        "",
+        "[server]",
+        f"listen_addr = {toml_string(host.get('studio', {}).get('listen_addr', '127.0.0.1:18100'))}",
+        "",
+        "[registry]",
+        f"path = {toml_string(str(runtime_root / 'studio' / 'data' / 'registry.toml'))}",
+        f"mcp_root = {toml_string(str(runtime_root))}",
+        "",
+        "[tunnel]",
+        "name = \"Secure tunnel\"",
+        f"runtime = {toml_string(str(runtime_root / 'tunnel-client' / 'current' / 'tunnel-client-runtime-cloudflared'))}",
+        f"working_dir = {toml_string(str(runtime_root / 'tunnel-client'))}",
+        f"config_file = {toml_string(str(runtime_root / 'tunnel-client' / 'config.yaml'))}",
+        "",
+    ]
+    binary_names = {"filesystem": "rust-mcp-filesystem", "git": "rust-mcp-git", "exec": "rust-mcp-exec"}
+    display_names = {"filesystem": "Filesystem", "git": "Git", "exec": "Exec"}
+    for name in ("filesystem", "git", "exec"):
+        server = host["servers"][name]
+        args = ["--root", workspace_root]
+        args.extend(str(item) for item in server.get("extra_args", []))
+        lines.extend([
+            f"[mcp.{name}]",
+            f"name = {toml_string(display_names[name])}",
+            f"command = {toml_string(str(runtime_root / name / binary_names[name]))}",
+            f"working_dir = {toml_string(str(runtime_root / name))}",
+            f"args = {toml_array(args)}",
+        ])
+        env = server.get("env", {})
+        if env:
+            lines.append(f"[mcp.{name}.env]")
+            for key in sorted(env):
+                lines.append(f"{key} = {toml_string(str(env[key]))}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def render_studio(host_name: str, check: bool) -> int:
+    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    output = Path(host["runtime_root"]).resolve() / "studio" / "studio.toml"
+    desired = studio_config_text(host)
+    current = output.read_text() if output.is_file() else None
+    if current == desired:
+        print("studio config: synchronized")
+        return 0
+    if check:
+        print(f"OUT-OF-SYNC: {output}")
+        return 1
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent, text=True)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(desired)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, output)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+    print(f"UPDATED: {output}")
+    return 0
+
+
+def tunnel_config_text(host: dict[str, Any]) -> str:
+    runtime_root = Path(host["runtime_root"]).resolve()
+    gateway = runtime_root / "gateway" / "rust-mcp-gateway"
+    server_dir = runtime_root / "gateway" / "servers.d"
+    lines = [
+        "config_version: 1", "",
+        "control_plane:", "  base_url: \"https://api.openai.com\"", "  poll_channels:", "    - main", "",
+        "health:", "  listen_addr: \"127.0.0.1:18080\"", "",
+        "admin_ui:", "  open_browser: false", "",
+        "log:", "  level: \"info\"", "  format: \"struct-text\"", "",
+        "mcp:", "  commands:", "    - channel: main",
+        f"      command: \"{gateway} --config-dir {server_dir}\"",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def render_tunnel_config(host_name: str, check: bool) -> int:
+    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    output = Path(host["runtime_root"]).resolve() / "tunnel-client" / "config.yaml"
+    desired = tunnel_config_text(host)
+    current = output.read_text() if output.is_file() else None
+    if current == desired:
+        print("tunnel config: synchronized")
+        return 0
+    if check:
+        print(f"OUT-OF-SYNC: {output}")
+        return 1
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent, text=True)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(desired)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, output)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+    print(f"UPDATED: {output}")
+    return 0
+
+
+def deploy_control(host_name: str) -> int:
+    host_path = FLEET_DIR / "hosts" / f"{host_name}.toml"
+    host = load_toml(host_path)
+    destination = Path(host["runtime_root"]).resolve() / "fleet"
+    (destination / "scripts").mkdir(parents=True, exist_ok=True)
+    (destination / "hosts").mkdir(parents=True, exist_ok=True)
+    copies = [
+        (FLEET_CONFIG, destination / "fleet.toml"),
+        (Path(__file__).resolve(), destination / "scripts" / "fleetctl.py"),
+        (host_path, destination / "hosts" / host_path.name),
+        (FLEET_DIR / "README.md", destination / "README.md"),
+    ]
+    for source, target in copies:
+        shutil.copy2(source, target)
+    (destination / "scripts" / "fleetctl.py").chmod(0o755)
+    print(f"DEPLOYED: fleet control -> {destination}")
+    return 0
+
+
 def install_component(host_name: str, component_name: str) -> int:
     fleet = load_toml(FLEET_CONFIG)
     host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
@@ -473,7 +612,7 @@ def install_component(host_name: str, component_name: str) -> int:
     if component.get("kind") != "git":
         print(f"fleetctl: {component_name} is not a source-built component", file=sys.stderr)
         return 2
-    source = component_path(component) / component["build_output"]
+    source = component_path(component, host) / component["build_output"]
     if not source.is_file():
         print(f"fleetctl: build output is missing: {source}", file=sys.stderr)
         return 2
@@ -515,6 +654,14 @@ def parse_args() -> argparse.Namespace:
     render = sub.add_parser("render-gateway")
     render.add_argument("--host", required=True)
     render.add_argument("--check", action="store_true")
+    render_studio_parser = sub.add_parser("render-studio")
+    render_studio_parser.add_argument("--host", required=True)
+    render_studio_parser.add_argument("--check", action="store_true")
+    render_tunnel_parser = sub.add_parser("render-tunnel")
+    render_tunnel_parser.add_argument("--host", required=True)
+    render_tunnel_parser.add_argument("--check", action="store_true")
+    deploy_parser = sub.add_parser("deploy-control")
+    deploy_parser.add_argument("--host", required=True)
     install = sub.add_parser("install")
     install.add_argument("--host", required=True)
     install.add_argument("--component", required=True)
@@ -538,6 +685,12 @@ def main() -> int:
             return snapshot(args.host)
         if args.command == "render-gateway":
             return render_gateway(args.host, args.check)
+        if args.command == "render-studio":
+            return render_studio(args.host, args.check)
+        if args.command == "render-tunnel":
+            return render_tunnel_config(args.host, args.check)
+        if args.command == "deploy-control":
+            return deploy_control(args.host)
         if args.command == "install":
             return install_component(args.host, args.component)
         if args.command == "tunnel-check":

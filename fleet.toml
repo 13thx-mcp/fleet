@@ -9,7 +9,7 @@ build_profile = "release"
 
 [components.filesystem]
 kind = "git"
-path = "../filesystem"
+source_dir = "filesystem"
 repository = "https://github.com/13thx-mcp/filesystem.git"
 package = "rust-mcp-filesystem"
 build_output = "target/release/rust-mcp-filesystem"
@@ -20,7 +20,7 @@ test = ["cargo", "test", "--all-targets", "--all-features"]
 
 [components.git]
 kind = "git"
-path = "../git"
+source_dir = "git"
 repository = "https://github.com/13thx-mcp/git.git"
 package = "rust-mcp-git"
 build_output = "target/release/rust-mcp-git"
@@ -31,7 +31,7 @@ test = ["cargo", "test", "--all-targets", "--all-features"]
 
 [components.exec]
 kind = "git"
-path = "../exec"
+source_dir = "exec"
 repository = "https://github.com/13thx-mcp/exec.git"
 package = "rust-mcp-exec"
 build_output = "target/release/rust-mcp-exec"
@@ -42,7 +42,7 @@ test = ["cargo", "test", "--all-targets", "--all-features"]
 
 [components.gateway]
 kind = "git"
-path = "../gateway"
+source_dir = "gateway"
 repository = "https://github.com/13thx-mcp/gateway.git"
 package = "rust-mcp-gateway"
 build_output = "target/release/rust-mcp-gateway"
@@ -53,7 +53,7 @@ test = ["cargo", "test", "--all-targets", "--all-features"]
 
 [components.studio]
 kind = "git"
-path = "../studio"
+source_dir = "studio"
 repository = "https://github.com/13thx-mcp/studio.git"
 package = "mcp-studio"
 build_output = "target/release/mcp-studio"

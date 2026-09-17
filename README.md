@@ -26,6 +26,9 @@ python3 scripts/fleetctl.py status --host aira
 python3 scripts/fleetctl.py doctor --host aira
 python3 scripts/fleetctl.py render-gateway --host aira --check
 python3 scripts/fleetctl.py render-gateway --host aira
+python3 scripts/fleetctl.py render-studio --host aira
+python3 scripts/fleetctl.py render-tunnel --host aira
+python3 scripts/fleetctl.py deploy-control --host aira
 python3 scripts/fleetctl.py install --host aira --component filesystem
 python3 scripts/fleetctl.py tunnel-check --host aira
 python3 scripts/fleetctl.py tunnel-update --host aira
@@ -73,3 +76,23 @@ mcp-server/bin/tunnel-client/
 Development hosts may contain both `mcp-server/src` and `mcp-server/bin`. Runtime-only hosts may omit source checkouts entirely and install only versioned release artifacts under `mcp-server/bin`. Gateway and Studio runtime configuration must reference `bin`, never `target/release` directly.
 
 Project-owned source repositories are hosted under the private GitHub organization `13thx-mcp`. `tunnel-client` is the exception: it tracks the official `openai/tunnel-client` releases directly.
+
+## Runtime-only control bundle
+
+`deploy-control` copies the fleet manifest, the selected host profile, documentation, and `fleetctl.py` into `mcp-server/bin/fleet`. The deployed copy resolves source repositories from `host.source_root` instead of assuming it lives beside source checkouts. This allows `bin/fleet` to run `status`, `doctor`, `render-*`, and official tunnel release checks/updates on hosts where `mcp-server/src` is absent. Source-build/install commands naturally require the corresponding source checkout.
+
+Runtime configuration is generated outside source repositories:
+
+```text
+mcp-server/bin/
+├── fleet/
+├── gateway/
+│   └── servers.d/
+├── studio/
+│   ├── studio.toml
+│   └── data/registry.toml
+└── tunnel-client/
+    ├── config.yaml
+    ├── current -> releases/vX.Y.Z
+    └── releases/
+```
