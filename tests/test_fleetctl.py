@@ -71,6 +71,18 @@ class FleetCtlTests(unittest.TestCase):
         component = {"source_dir": "gateway"}
         self.assertEqual(fleetctl.component_path(component, host), Path('/work/mcp-server/gateway'))
 
+    def test_component_install_scope_separates_mcp_bin_and_services(self) -> None:
+        host = {
+            "bin_root": "/work/mcp-server/bin",
+            "runtime_root": "/work/mcp-server/runtime",
+        }
+        mcp = {"kind": "git", "binary": "rust-mcp-git"}
+        studio = {"kind": "git", "install_scope": "runtime", "install_dir": "studio", "binary": "mcp-studio"}
+        self.assertEqual(fleetctl.component_install_dir("git", mcp, host), Path('/work/mcp-server/bin'))
+        self.assertEqual(fleetctl.component_install_dir("studio", studio, host), Path('/work/mcp-server/runtime/studio'))
+        with self.assertRaises(RuntimeError):
+            fleetctl.component_install_dir("bad", {"kind": "git", "install_scope": "other"}, host)
+
 
 if __name__ == "__main__":
     unittest.main()
