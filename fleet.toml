@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 fleet_name = "mcp-local-dev"
 
 [policy]
@@ -10,8 +10,10 @@ build_profile = "release"
 [components.filesystem]
 kind = "git"
 path = "../filesystem"
+repository = "https://github.com/13thx-mcp/filesystem.git"
 package = "rust-mcp-filesystem"
-binary = "target/release/rust-mcp-filesystem"
+build_output = "target/release/rust-mcp-filesystem"
+binary = "rust-mcp-filesystem"
 required = true
 build = ["cargo", "build", "--release", "--locked"]
 test = ["cargo", "test", "--all-targets", "--all-features"]
@@ -19,8 +21,10 @@ test = ["cargo", "test", "--all-targets", "--all-features"]
 [components.git]
 kind = "git"
 path = "../git"
+repository = "https://github.com/13thx-mcp/git.git"
 package = "rust-mcp-git"
-binary = "target/release/rust-mcp-git"
+build_output = "target/release/rust-mcp-git"
+binary = "rust-mcp-git"
 required = true
 build = ["cargo", "build", "--release", "--locked"]
 test = ["cargo", "test", "--all-targets", "--all-features"]
@@ -28,8 +32,10 @@ test = ["cargo", "test", "--all-targets", "--all-features"]
 [components.exec]
 kind = "git"
 path = "../exec"
+repository = "https://github.com/13thx-mcp/exec.git"
 package = "rust-mcp-exec"
-binary = "target/release/rust-mcp-exec"
+build_output = "target/release/rust-mcp-exec"
+binary = "rust-mcp-exec"
 required = true
 build = ["cargo", "build", "--release", "--locked"]
 test = ["cargo", "test", "--all-targets", "--all-features"]
@@ -37,8 +43,10 @@ test = ["cargo", "test", "--all-targets", "--all-features"]
 [components.gateway]
 kind = "git"
 path = "../gateway"
+repository = "https://github.com/13thx-mcp/gateway.git"
 package = "rust-mcp-gateway"
-binary = "target/release/rust-mcp-gateway"
+build_output = "target/release/rust-mcp-gateway"
+binary = "rust-mcp-gateway"
 required = true
 build = ["cargo", "build", "--release", "--locked"]
 test = ["cargo", "test", "--all-targets", "--all-features"]
@@ -46,15 +54,20 @@ test = ["cargo", "test", "--all-targets", "--all-features"]
 [components.studio]
 kind = "git"
 path = "../studio"
+repository = "https://github.com/13thx-mcp/studio.git"
 package = "mcp-studio"
-binary = "target/release/mcp-studio"
+build_output = "target/release/mcp-studio"
+binary = "mcp-studio"
 required = true
 build = ["cargo", "build", "--release", "--locked"]
 test = ["cargo", "test", "--all-targets", "--all-features"]
 
 [components.tunnel-client]
-kind = "bundle"
-path = "../tunnel-client"
+kind = "upstream_release"
+repository = "https://github.com/openai/tunnel-client"
+release_api = "https://api.github.com/repos/openai/tunnel-client/releases/latest"
+asset_prefix = "tunnel-client-runtime-cloudflared"
+install_dir = "tunnel-client"
 binary = "tunnel-client-runtime-cloudflared"
 manifest = "cloudflared-manifest.json"
 local_config = "config.yaml"
