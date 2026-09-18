@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import urllib.request
 import zipfile
@@ -719,6 +720,449 @@ def snapshot(host_name: str) -> int:
     return 0
 
 
+
+SELF_UPDATE_SCHEMA_VERSION = 1
+SELF_UPDATE_HEALTH_TIMEOUT_SECONDS = 20.0
+SELF_UPDATE_PARENT_EXIT_TIMEOUT_SECONDS = 15.0
+SELF_UPDATE_POLL_SECONDS = 0.2
+SELF_UPDATE_MAX_FILES = 8192
+SELF_UPDATE_MAX_BYTES = 1024 * 1024 * 1024
+
+
+def safe_self_update_transaction_id(value: str) -> bool:
+    return (
+        value.startswith("txn-studio-")
+        and len(value) <= 128
+        and all(char.isalnum() or char in "-_" for char in value)
+    )
+
+
+def self_update_transaction_path(host: dict[str, Any], transaction_id: str) -> Path:
+    if not safe_self_update_transaction_id(transaction_id):
+        raise RuntimeError("invalid Studio self-update transaction id")
+    runtime_root = Path(host["runtime_root"]).resolve()
+    return runtime_root / "studio" / "data" / "self-update" / f"{transaction_id}.json"
+
+
+def read_regular_json(path: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"self-update metadata is not a regular file: {path}")
+    return json.loads(path.read_text())
+
+
+def fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(temp_fd, "w") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+        fsync_dir(path.parent)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def self_update_tree_fingerprint(root: Path) -> str:
+    resolved_root = root.resolve()
+    if root.is_symlink() or not resolved_root.is_dir():
+        raise RuntimeError("Studio self-update release candidate must be a regular directory")
+
+    files: list[tuple[str, str]] = []
+    total = 0
+    for current, dirs, names in os.walk(resolved_root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        for name in list(dirs):
+            path = current_path / name
+            if path.is_symlink():
+                raise RuntimeError("Studio self-update candidate contains a symlink")
+        for name in names:
+            path = current_path / name
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError("Studio self-update candidate contains an unsafe entry")
+            relative = path.relative_to(resolved_root).as_posix()
+            data = path.read_bytes()
+            total += len(data)
+            if len(files) >= SELF_UPDATE_MAX_FILES or total > SELF_UPDATE_MAX_BYTES:
+                raise RuntimeError("Studio self-update candidate exceeds safety limits")
+            files.append((relative, hashlib.sha256(data).hexdigest()))
+
+    files.sort()
+    digest = hashlib.sha256()
+    for relative, file_digest in files:
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_digest.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def validate_self_update_release(release: Path, version: str, fingerprint: str) -> None:
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise RuntimeError("invalid Studio target version")
+    binary = release / "mcp-studio"
+    web_index = release / "web" / "dist" / "index.html"
+    if binary.is_symlink() or not binary.is_file():
+        raise RuntimeError("Studio target binary is unavailable")
+    if web_index.is_symlink() or not web_index.is_file():
+        raise RuntimeError("Studio target web/dist/index.html is unavailable")
+    actual_version = binary_version(binary)
+    if actual_version != version:
+        raise RuntimeError(
+            f"Studio target binary version mismatch: expected {version}, got {actual_version}"
+        )
+    if self_update_tree_fingerprint(release) != fingerprint:
+        raise RuntimeError("Studio target release fingerprint mismatch")
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def wait_for_pid_exit(pid: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(SELF_UPDATE_POLL_SECONDS)
+    return not pid_alive(pid)
+
+
+def safe_release_target(studio_root: Path, target: str) -> Path:
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", target):
+        raise RuntimeError("invalid Studio release directory")
+    releases = (studio_root / "releases").resolve()
+    releases.mkdir(parents=True, exist_ok=True)
+    path = releases / target
+    if path.resolve(strict=False).parent != releases:
+        raise RuntimeError("Studio release path escaped releases root")
+    return path
+
+
+def candidate_target(studio_root: Path, transaction_id: str, candidate_name: str) -> Path:
+    expected = f".candidate-{transaction_id}"
+    if candidate_name != expected:
+        raise RuntimeError("Studio candidate directory identity mismatch")
+    releases = (studio_root / "releases").resolve()
+    releases.mkdir(parents=True, exist_ok=True)
+    path = releases / candidate_name
+    if path.resolve(strict=False).parent != releases:
+        raise RuntimeError("Studio candidate path escaped releases root")
+    return path
+
+
+def current_release_target(studio_root: Path) -> str | None:
+    current = studio_root / "current"
+    if not current.exists() and not current.is_symlink():
+        return None
+    if not current.is_symlink():
+        raise RuntimeError("Studio current activation pointer is not a symlink")
+    target = os.readlink(current)
+    path = Path(target)
+    if path.is_absolute() or len(path.parts) != 2 or path.parts[0] != "releases":
+        raise RuntimeError("Studio current activation pointer is unsafe")
+    release_name = path.parts[1]
+    safe_release_target(studio_root, release_name)
+    resolved = (studio_root / path).resolve()
+    releases = (studio_root / "releases").resolve()
+    if resolved.parent != releases or not resolved.is_dir():
+        raise RuntimeError("Studio current release target is unavailable")
+    return release_name
+
+
+def atomic_set_current(studio_root: Path, release_name: str, transaction_id: str) -> None:
+    safe_release_target(studio_root, release_name)
+    current = studio_root / "current"
+    if current.exists() and not current.is_symlink():
+        raise RuntimeError("Studio current activation pointer is not a symlink")
+    temp = studio_root / f".current-{transaction_id}.tmp"
+    if temp.exists() or temp.is_symlink():
+        temp.unlink()
+    os.symlink(f"releases/{release_name}", temp)
+    os.replace(temp, current)
+    fsync_dir(studio_root)
+
+
+def clear_current(studio_root: Path) -> None:
+    current = studio_root / "current"
+    if current.is_symlink():
+        current.unlink()
+        fsync_dir(studio_root)
+    elif current.exists():
+        raise RuntimeError("Studio current activation pointer is not a symlink")
+
+
+def studio_listen_url(studio_root: Path) -> str:
+    config_path = studio_root / "studio.toml"
+    config = load_toml(config_path)
+    listen = str(config.get("server", {}).get("listen_addr", "127.0.0.1:18100"))
+    if listen.count(":") != 1:
+        raise RuntimeError("Studio self-update health endpoint requires IPv4 loopback listen_addr")
+    host, port_text = listen.rsplit(":", 1)
+    if host not in {"127.0.0.1", "localhost"}:
+        raise RuntimeError("Studio self-update health endpoint must be loopback")
+    port = int(port_text)
+    if port <= 0 or port > 65535:
+        raise RuntimeError("Studio self-update health port is invalid")
+    return f"http://{host}:{port}/health"
+
+
+def studio_health(studio_root: Path, expected_version: str) -> bool:
+    try:
+        with urllib.request.urlopen(studio_listen_url(studio_root), timeout=1.0) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read(64 * 1024))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        payload.get("status") == "ok"
+        and payload.get("service") == "mcp-studio"
+        and payload.get("version") == expected_version
+    )
+
+
+def wait_for_studio_health(studio_root: Path, expected_version: str) -> bool:
+    deadline = time.monotonic() + SELF_UPDATE_HEALTH_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if studio_health(studio_root, expected_version):
+            return True
+        time.sleep(SELF_UPDATE_POLL_SECONDS)
+    return studio_health(studio_root, expected_version)
+
+
+def minimal_studio_env() -> dict[str, str]:
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+    }
+    for key in ("HOME", "TMPDIR"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
+
+
+def spawn_studio(studio_root: Path, binary: Path, cwd: Path) -> subprocess.Popen[bytes]:
+    config_path = studio_root / "studio.toml"
+    if binary.is_symlink() or not binary.is_file():
+        raise RuntimeError("Studio launch binary is unavailable")
+    return subprocess.Popen(
+        [str(binary), "--config", str(config_path)],
+        cwd=cwd,
+        env=minimal_studio_env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def stop_spawned_process(proc: subprocess.Popen[bytes] | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=3)
+
+
+def update_self_update_metadata(
+    path: Path,
+    metadata: dict[str, Any],
+    phase: str,
+    *,
+    error: str | None = None,
+    rollback_succeeded: bool | None = None,
+) -> None:
+    metadata["phase"] = phase
+    metadata["error"] = error
+    metadata["rollback_succeeded"] = rollback_succeeded
+    metadata["updated_at_ms"] = int(time.time() * 1000)
+    write_json_atomic(path, metadata)
+
+
+def validate_self_update_metadata(
+    metadata: dict[str, Any],
+    transaction_id: str,
+    parent_pid: int,
+) -> None:
+    if metadata.get("schema_version") != SELF_UPDATE_SCHEMA_VERSION:
+        raise RuntimeError("unsupported Studio self-update metadata schema")
+    if metadata.get("transaction_id") != transaction_id:
+        raise RuntimeError("Studio self-update transaction identity mismatch")
+    if metadata.get("component") != "studio":
+        raise RuntimeError("Studio self-update metadata component mismatch")
+    if metadata.get("parent_pid") != parent_pid:
+        raise RuntimeError("Studio self-update parent PID mismatch")
+    if metadata.get("phase") not in {
+        "activation_pending",
+        "external_activating",
+        "external_activated",
+    }:
+        raise RuntimeError("Studio self-update transaction is not activation-pending")
+
+
+def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int:
+    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    runtime_root = Path(host["runtime_root"]).resolve()
+    studio_root = runtime_root / "studio"
+    metadata_path = self_update_transaction_path(host, transaction_id)
+    metadata = read_regular_json(metadata_path)
+    validate_self_update_metadata(metadata, transaction_id, parent_pid)
+
+    source_version = str(metadata["source_version"])
+    target_version = str(metadata["target_version"])
+    candidate_name = str(metadata["candidate_dir"])
+    target_release = str(metadata["target_release"])
+    fingerprint = str(metadata["candidate_fingerprint"])
+
+    releases = studio_root / "releases"
+    releases.mkdir(parents=True, exist_ok=True)
+    candidate = candidate_target(studio_root, transaction_id, candidate_name)
+    target = safe_release_target(studio_root, target_release)
+
+    # Resume-safe fast path after a launcher interruption.
+    if current_release_target(studio_root) == target_release and target.is_dir():
+        validate_self_update_release(target, target_version, fingerprint)
+        if studio_health(studio_root, target_version):
+            update_self_update_metadata(metadata_path, metadata, "completed")
+            return 0
+
+    if metadata["phase"] == "activation_pending":
+        if not wait_for_pid_exit(parent_pid, SELF_UPDATE_PARENT_EXIT_TIMEOUT_SECONDS):
+            update_self_update_metadata(
+                metadata_path,
+                metadata,
+                "activation_failed",
+                error="parent_exit_timeout",
+            )
+            return 2
+
+    update_self_update_metadata(metadata_path, metadata, "external_activating")
+
+    previous_release = current_release_target(studio_root)
+    legacy_binary = studio_root / "mcp-studio"
+    if previous_release is not None:
+        previous_layout = "versioned"
+        previous_binary = studio_root / "releases" / previous_release / "mcp-studio"
+    elif legacy_binary.is_file() and not legacy_binary.is_symlink():
+        previous_layout = "legacy_flat"
+        previous_binary = legacy_binary
+    else:
+        update_self_update_metadata(
+            metadata_path,
+            metadata,
+            "activation_failed",
+            error="previous_release_unavailable",
+        )
+        return 2
+
+    if binary_version(previous_binary) != source_version:
+        update_self_update_metadata(
+            metadata_path,
+            metadata,
+            "activation_failed",
+            error="source_version_mismatch",
+        )
+        return 2
+
+    metadata["previous_layout"] = previous_layout
+    metadata["previous_release"] = previous_release
+    write_json_atomic(metadata_path, metadata)
+
+    try:
+        if target.exists():
+            validate_self_update_release(target, target_version, fingerprint)
+            if candidate.exists():
+                if self_update_tree_fingerprint(candidate) != fingerprint:
+                    raise RuntimeError("Studio candidate fingerprint changed")
+                shutil.rmtree(candidate)
+        else:
+            validate_self_update_release(candidate, target_version, fingerprint)
+            os.replace(candidate, target)
+            fsync_dir(releases)
+
+        atomic_set_current(studio_root, target_release, transaction_id)
+        update_self_update_metadata(metadata_path, metadata, "external_activated")
+
+        target_proc = spawn_studio(studio_root, target / "mcp-studio", target)
+        if wait_for_studio_health(studio_root, target_version):
+            update_self_update_metadata(metadata_path, metadata, "completed")
+            return 0
+
+        stop_spawned_process(target_proc)
+        update_self_update_metadata(
+            metadata_path,
+            metadata,
+            "rolling_back",
+            error="target_health_failed",
+        )
+
+        if previous_layout == "versioned":
+            assert previous_release is not None
+            atomic_set_current(studio_root, previous_release, transaction_id)
+            rollback_binary = studio_root / "releases" / previous_release / "mcp-studio"
+            rollback_cwd = rollback_binary.parent
+        else:
+            clear_current(studio_root)
+            rollback_binary = legacy_binary
+            rollback_cwd = studio_root
+
+        rollback_proc = spawn_studio(studio_root, rollback_binary, rollback_cwd)
+        if wait_for_studio_health(studio_root, source_version):
+            update_self_update_metadata(
+                metadata_path,
+                metadata,
+                "rolled_back",
+                error="target_health_failed",
+                rollback_succeeded=True,
+            )
+            return 3
+
+        stop_spawned_process(rollback_proc)
+        update_self_update_metadata(
+            metadata_path,
+            metadata,
+            "rollback_failed",
+            error="rollback_health_failed",
+            rollback_succeeded=False,
+        )
+        return 4
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        update_self_update_metadata(
+            metadata_path,
+            metadata,
+            "activation_failed",
+            error="launcher_activation_failed",
+        )
+        print(f"fleetctl: Studio activation failed: {exc}", file=sys.stderr)
+        return 2
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MCP fleet foundation tool")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -727,6 +1171,10 @@ def parse_args() -> argparse.Namespace:
         cmd.add_argument("--host", required=True)
     doctor_parser = sub.choices["doctor"]
     doctor_parser.add_argument("--require-remotes", action="store_true")
+    studio_activate_parser = sub.add_parser("studio-activate")
+    studio_activate_parser.add_argument("--host", required=True)
+    studio_activate_parser.add_argument("--transaction", required=True)
+    studio_activate_parser.add_argument("--parent-pid", required=True, type=int)
     render_plan_parser = sub.add_parser("render-plan")
     render_plan_parser.add_argument("--host", required=True)
     render_plan_parser.add_argument("--json", action="store_true")
@@ -762,6 +1210,8 @@ def main() -> int:
             return doctor(collect(args.host), args.require_remotes)
         if args.command == "snapshot":
             return snapshot(args.host)
+        if args.command == "studio-activate":
+            return studio_activate(args.host, args.transaction, args.parent_pid)
         if args.command == "render-plan":
             return render_plan(args.host, args.json)
         if args.command == "render-gateway":
