@@ -1026,6 +1026,63 @@ def validate_self_update_metadata(
         raise RuntimeError("Studio self-update transaction is not activation-pending")
 
 
+def rollback_studio_release(
+    studio_root: Path,
+    metadata_path: Path,
+    metadata: dict[str, Any],
+    transaction_id: str,
+    previous_layout: str,
+    previous_release: str | None,
+    legacy_binary: Path,
+    source_version: str,
+    reason: str,
+) -> int:
+    update_self_update_metadata(
+        metadata_path,
+        metadata,
+        "rolling_back",
+        error=reason,
+    )
+    if previous_layout == "versioned":
+        if previous_release is None:
+            update_self_update_metadata(
+                metadata_path,
+                metadata,
+                "rollback_failed",
+                error="rollback_previous_release_missing",
+                rollback_succeeded=False,
+            )
+            return 4
+        atomic_set_current(studio_root, previous_release, transaction_id)
+        rollback_binary = studio_root / "releases" / previous_release / "mcp-studio"
+        rollback_cwd = rollback_binary.parent
+    else:
+        clear_current(studio_root)
+        rollback_binary = legacy_binary
+        rollback_cwd = studio_root
+
+    rollback_proc = spawn_studio(studio_root, rollback_binary, rollback_cwd)
+    if wait_for_studio_health(studio_root, source_version):
+        update_self_update_metadata(
+            metadata_path,
+            metadata,
+            "rolled_back",
+            error=reason,
+            rollback_succeeded=True,
+        )
+        return 3
+
+    stop_spawned_process(rollback_proc)
+    update_self_update_metadata(
+        metadata_path,
+        metadata,
+        "rollback_failed",
+        error="rollback_health_failed",
+        rollback_succeeded=False,
+    )
+    return 4
+
+
 def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int:
     host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
     runtime_root = Path(host["runtime_root"]).resolve()
@@ -1094,6 +1151,8 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
     metadata["previous_release"] = previous_release
     write_json_atomic(metadata_path, metadata)
 
+    switched = False
+    target_proc: subprocess.Popen[bytes] | None = None
     try:
         if target.exists():
             validate_self_update_release(target, target_version, fingerprint)
@@ -1107,6 +1166,7 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
             fsync_dir(releases)
 
         atomic_set_current(studio_root, target_release, transaction_id)
+        switched = True
         update_self_update_metadata(metadata_path, metadata, "external_activated")
 
         target_proc = spawn_studio(studio_root, target / "mcp-studio", target)
@@ -1115,51 +1175,52 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
             return 0
 
         stop_spawned_process(target_proc)
-        update_self_update_metadata(
+        return rollback_studio_release(
+            studio_root,
             metadata_path,
             metadata,
-            "rolling_back",
-            error="target_health_failed",
+            transaction_id,
+            previous_layout,
+            previous_release,
+            legacy_binary,
+            source_version,
+            "target_health_failed",
         )
-
-        if previous_layout == "versioned":
-            assert previous_release is not None
-            atomic_set_current(studio_root, previous_release, transaction_id)
-            rollback_binary = studio_root / "releases" / previous_release / "mcp-studio"
-            rollback_cwd = rollback_binary.parent
-        else:
-            clear_current(studio_root)
-            rollback_binary = legacy_binary
-            rollback_cwd = studio_root
-
-        rollback_proc = spawn_studio(studio_root, rollback_binary, rollback_cwd)
-        if wait_for_studio_health(studio_root, source_version):
-            update_self_update_metadata(
-                metadata_path,
-                metadata,
-                "rolled_back",
-                error="target_health_failed",
-                rollback_succeeded=True,
-            )
-            return 3
-
-        stop_spawned_process(rollback_proc)
-        update_self_update_metadata(
-            metadata_path,
-            metadata,
-            "rollback_failed",
-            error="rollback_health_failed",
-            rollback_succeeded=False,
-        )
-        return 4
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        stop_spawned_process(target_proc)
+        print(f"fleetctl: Studio activation failed: {exc}", file=sys.stderr)
+        if switched:
+            try:
+                return rollback_studio_release(
+                    studio_root,
+                    metadata_path,
+                    metadata,
+                    transaction_id,
+                    previous_layout,
+                    previous_release,
+                    legacy_binary,
+                    source_version,
+                    "launcher_activation_failed",
+                )
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as rollback_exc:
+                update_self_update_metadata(
+                    metadata_path,
+                    metadata,
+                    "rollback_failed",
+                    error="rollback_exception",
+                    rollback_succeeded=False,
+                )
+                print(
+                    f"fleetctl: Studio rollback failed after launcher exception: {rollback_exc}",
+                    file=sys.stderr,
+                )
+                return 4
         update_self_update_metadata(
             metadata_path,
             metadata,
             "activation_failed",
             error="launcher_activation_failed",
         )
-        print(f"fleetctl: Studio activation failed: {exc}", file=sys.stderr)
         return 2
 
 

@@ -265,6 +265,43 @@ class FleetCtlTests(unittest.TestCase):
                 fleetctl.FLEET_DIR = original_fleet_dir
                 fleetctl.FLEET_CONFIG = original_fleet_config
 
+    def test_studio_activate_exception_after_switch_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            fleet_root, tx = self._self_update_fixture(root)
+            original_fleet_dir = fleetctl.FLEET_DIR
+            original_fleet_config = fleetctl.FLEET_CONFIG
+            fleetctl.FLEET_DIR = fleet_root
+            fleetctl.FLEET_CONFIG = fleet_root / "fleet.toml"
+            try:
+                def fake_version(path: Path) -> str:
+                    return "0.5.0" if "releases" in path.parts else "0.4.0"
+
+                rollback_proc = mock.Mock()
+                rollback_proc.poll.return_value = None
+                with (
+                    mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
+                    mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
+                    mock.patch.object(
+                        fleetctl,
+                        "spawn_studio",
+                        side_effect=[OSError("forced spawn failure"), rollback_proc],
+                    ),
+                    mock.patch.object(fleetctl, "wait_for_studio_health", return_value=True),
+                ):
+                    self.assertEqual(fleetctl.studio_activate("test", tx, 999), 3)
+                studio_root = root / "runtime/studio"
+                self.assertFalse((studio_root / "current").exists())
+                state = fleetctl.read_regular_json(
+                    studio_root / "data/self-update" / f"{tx}.json"
+                )
+                self.assertEqual(state["phase"], "rolled_back")
+                self.assertTrue(state["rollback_succeeded"])
+                self.assertEqual(state["error"], "launcher_activation_failed")
+            finally:
+                fleetctl.FLEET_DIR = original_fleet_dir
+                fleetctl.FLEET_CONFIG = original_fleet_config
+
     def test_component_path_uses_host_source_root(self) -> None:
         host = {"source_root": "/work/mcp-server"}
         component = {"source_dir": "gateway"}
