@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 
@@ -115,6 +116,154 @@ class FleetCtlTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(payload).hexdigest(), item["sha256"])
             self.assertEqual(item["ownership"], "fleet_managed")
             self.assertNotIn("target/release", payload.decode())
+
+    def test_self_update_tree_fingerprint_is_deterministic_and_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            release = root / "release"
+            (release / "web/dist").mkdir(parents=True)
+            (release / "mcp-studio").write_bytes(b"binary")
+            (release / "web/dist/index.html").write_text("index")
+            first = fleetctl.self_update_tree_fingerprint(release)
+            second = fleetctl.self_update_tree_fingerprint(release)
+            self.assertEqual(first, second)
+
+            link = release / "web/dist/link"
+            try:
+                link.symlink_to("index.html")
+            except (OSError, NotImplementedError):
+                return
+            with self.assertRaises(RuntimeError):
+                fleetctl.self_update_tree_fingerprint(release)
+
+    def test_self_update_metadata_rejects_wrong_parent_or_identity(self) -> None:
+        metadata = {
+            "schema_version": 1,
+            "transaction_id": "txn-studio-good",
+            "component": "studio",
+            "parent_pid": 123,
+            "phase": "activation_pending",
+        }
+        fleetctl.validate_self_update_metadata(metadata, "txn-studio-good", 123)
+        with self.assertRaises(RuntimeError):
+            fleetctl.validate_self_update_metadata(metadata, "txn-studio-other", 123)
+        with self.assertRaises(RuntimeError):
+            fleetctl.validate_self_update_metadata(metadata, "txn-studio-good", 124)
+
+    def _self_update_fixture(self, root: Path) -> tuple[Path, str]:
+        fleet_root = root / "fleet"
+        runtime_root = root / "runtime"
+        studio_root = runtime_root / "studio"
+        (fleet_root / "hosts").mkdir(parents=True)
+        (studio_root / "data/self-update").mkdir(parents=True)
+        (studio_root / "releases").mkdir(parents=True)
+        (studio_root / "studio.toml").write_text(
+            '[server]\nlisten_addr = "127.0.0.1:18100"\n'
+        )
+        (studio_root / "mcp-studio").write_bytes(b"old")
+
+        host = "test"
+        (fleet_root / "hosts" / f"{host}.toml").write_text(
+            f'host_id = "{host}"\nruntime_root = "{runtime_root}"\n'
+        )
+        tx = "txn-studio-test"
+        candidate = studio_root / "releases" / f".candidate-{tx}"
+        (candidate / "web/dist").mkdir(parents=True)
+        (candidate / "mcp-studio").write_bytes(b"new")
+        (candidate / "web/dist/index.html").write_text("new web")
+        fingerprint = fleetctl.self_update_tree_fingerprint(candidate)
+        metadata = {
+            "schema_version": 1,
+            "transaction_id": tx,
+            "component": "studio",
+            "source_version": "0.4.0",
+            "target_version": "0.5.0",
+            "phase": "activation_pending",
+            "candidate_dir": f".candidate-{tx}",
+            "target_release": "v0.5.0",
+            "candidate_fingerprint": fingerprint,
+            "parent_pid": 999,
+            "rollback_succeeded": None,
+            "error": None,
+            "updated_at_ms": 1,
+        }
+        fleetctl.write_json_atomic(
+            studio_root / "data/self-update" / f"{tx}.json", metadata
+        )
+        return fleet_root, tx
+
+    def test_studio_activate_switches_versioned_release_and_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            fleet_root, tx = self._self_update_fixture(root)
+            original_fleet_dir = fleetctl.FLEET_DIR
+            original_fleet_config = fleetctl.FLEET_CONFIG
+            fleetctl.FLEET_DIR = fleet_root
+            fleetctl.FLEET_CONFIG = fleet_root / "fleet.toml"
+            try:
+                def fake_version(path: Path) -> str:
+                    return "0.5.0" if "releases" in path.parts else "0.4.0"
+
+                fake_process = mock.Mock()
+                fake_process.poll.return_value = None
+                with (
+                    mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
+                    mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
+                    mock.patch.object(fleetctl, "spawn_studio", return_value=fake_process),
+                    mock.patch.object(fleetctl, "wait_for_studio_health", return_value=True),
+                ):
+                    self.assertEqual(fleetctl.studio_activate("test", tx, 999), 0)
+                studio_root = root / "runtime/studio"
+                self.assertEqual(
+                    (studio_root / "current").readlink(),
+                    Path("releases/v0.5.0"),
+                )
+                state = fleetctl.read_regular_json(
+                    studio_root / "data/self-update" / f"{tx}.json"
+                )
+                self.assertEqual(state["phase"], "completed")
+                self.assertTrue((studio_root / "releases/v0.5.0/web/dist/index.html").is_file())
+            finally:
+                fleetctl.FLEET_DIR = original_fleet_dir
+                fleetctl.FLEET_CONFIG = original_fleet_config
+
+    def test_studio_activate_health_failure_rolls_back_legacy_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            fleet_root, tx = self._self_update_fixture(root)
+            original_fleet_dir = fleetctl.FLEET_DIR
+            original_fleet_config = fleetctl.FLEET_CONFIG
+            fleetctl.FLEET_DIR = fleet_root
+            fleetctl.FLEET_CONFIG = fleet_root / "fleet.toml"
+            try:
+                def fake_version(path: Path) -> str:
+                    return "0.5.0" if "releases" in path.parts else "0.4.0"
+
+                processes = [mock.Mock(), mock.Mock()]
+                for proc in processes:
+                    proc.poll.return_value = None
+                with (
+                    mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
+                    mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
+                    mock.patch.object(fleetctl, "spawn_studio", side_effect=processes),
+                    mock.patch.object(
+                        fleetctl,
+                        "wait_for_studio_health",
+                        side_effect=[False, True],
+                    ),
+                    mock.patch.object(fleetctl, "stop_spawned_process"),
+                ):
+                    self.assertEqual(fleetctl.studio_activate("test", tx, 999), 3)
+                studio_root = root / "runtime/studio"
+                self.assertFalse((studio_root / "current").exists())
+                state = fleetctl.read_regular_json(
+                    studio_root / "data/self-update" / f"{tx}.json"
+                )
+                self.assertEqual(state["phase"], "rolled_back")
+                self.assertTrue(state["rollback_succeeded"])
+            finally:
+                fleetctl.FLEET_DIR = original_fleet_dir
+                fleetctl.FLEET_CONFIG = original_fleet_config
 
     def test_component_path_uses_host_source_root(self) -> None:
         host = {"source_root": "/work/mcp-server"}
