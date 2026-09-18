@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -298,6 +299,48 @@ class FleetCtlTests(unittest.TestCase):
                 self.assertEqual(state["phase"], "rolled_back")
                 self.assertTrue(state["rollback_succeeded"])
                 self.assertEqual(state["error"], "launcher_activation_failed")
+            finally:
+                fleetctl.FLEET_DIR = original_fleet_dir
+                fleetctl.FLEET_CONFIG = original_fleet_config
+
+    def test_studio_activate_resume_after_current_switch_uses_persisted_previous_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            fleet_root, tx = self._self_update_fixture(root)
+            studio_root = root / "runtime/studio"
+            candidate = studio_root / "releases" / f".candidate-{tx}"
+            target = studio_root / "releases/v0.5.0"
+            os.replace(candidate, target)
+            (studio_root / "current").symlink_to("releases/v0.5.0")
+
+            metadata_path = studio_root / "data/self-update" / f"{tx}.json"
+            metadata = fleetctl.read_regular_json(metadata_path)
+            metadata["phase"] = "activation_pending"
+            metadata["previous_layout"] = "legacy_flat"
+            metadata["previous_release"] = None
+            fleetctl.write_json_atomic(metadata_path, metadata)
+
+            original_fleet_dir = fleetctl.FLEET_DIR
+            original_fleet_config = fleetctl.FLEET_CONFIG
+            fleetctl.FLEET_DIR = fleet_root
+            fleetctl.FLEET_CONFIG = fleet_root / "fleet.toml"
+            try:
+                def fake_version(path: Path) -> str:
+                    return "0.5.0" if "releases" in path.parts else "0.4.0"
+
+                proc = mock.Mock()
+                proc.poll.return_value = None
+                with (
+                    mock.patch.object(fleetctl, "studio_health", return_value=False),
+                    mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
+                    mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
+                    mock.patch.object(fleetctl, "spawn_studio", return_value=proc),
+                    mock.patch.object(fleetctl, "wait_for_studio_health", return_value=True),
+                ):
+                    self.assertEqual(fleetctl.studio_activate("test", tx, 999), 0)
+                state = fleetctl.read_regular_json(metadata_path)
+                self.assertEqual(state["phase"], "completed")
+                self.assertEqual(state["previous_layout"], "legacy_flat")
             finally:
                 fleetctl.FLEET_DIR = original_fleet_dir
                 fleetctl.FLEET_CONFIG = original_fleet_config

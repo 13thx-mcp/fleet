@@ -1121,20 +1121,45 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
 
     update_self_update_metadata(metadata_path, metadata, "external_activating")
 
-    previous_release = current_release_target(studio_root)
     legacy_binary = studio_root / "mcp-studio"
-    if previous_release is not None:
-        previous_layout = "versioned"
+    previous_layout = metadata.get("previous_layout")
+    previous_release = metadata.get("previous_release")
+    if previous_layout is None:
+        previous_release = current_release_target(studio_root)
+        if previous_release is not None:
+            previous_layout = "versioned"
+        elif legacy_binary.is_file() and not legacy_binary.is_symlink():
+            previous_layout = "legacy_flat"
+        else:
+            update_self_update_metadata(
+                metadata_path,
+                metadata,
+                "activation_failed",
+                error="previous_release_unavailable",
+            )
+            return 2
+        metadata["previous_layout"] = previous_layout
+        metadata["previous_release"] = previous_release
+        write_json_atomic(metadata_path, metadata)
+
+    if previous_layout == "versioned":
+        if not isinstance(previous_release, str):
+            update_self_update_metadata(
+                metadata_path,
+                metadata,
+                "activation_failed",
+                error="previous_release_unavailable",
+            )
+            return 2
         previous_binary = studio_root / "releases" / previous_release / "mcp-studio"
-    elif legacy_binary.is_file() and not legacy_binary.is_symlink():
-        previous_layout = "legacy_flat"
+    elif previous_layout == "legacy_flat":
         previous_binary = legacy_binary
     else:
         update_self_update_metadata(
             metadata_path,
             metadata,
             "activation_failed",
-            error="previous_release_unavailable",
+            error="previous_layout_invalid",
         )
         return 2
 
@@ -1146,10 +1171,6 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
             error="source_version_mismatch",
         )
         return 2
-
-    metadata["previous_layout"] = previous_layout
-    metadata["previous_release"] = previous_release
-    write_json_atomic(metadata_path, metadata)
 
     switched = False
     target_proc: subprocess.Popen[bytes] | None = None
