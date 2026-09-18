@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.util
 import tempfile
 import unittest
@@ -65,6 +67,54 @@ class FleetCtlTests(unittest.TestCase):
         self.assertIn('/work/mcp-server/bin/rust-mcp-gateway', tunnel)
         self.assertIn('/work/mcp-server/runtime/gateway/servers.d', tunnel)
         self.assertNotIn('/mcp-server/src/', tunnel)
+
+    def test_render_plan_is_deterministic_pure_and_root_relative(self) -> None:
+        host = {
+            "host_id": "test-host",
+            "workspace_root": "/work",
+            "source_root": "/work/mcp-server",
+            "bin_root": "/work/mcp-server/bin",
+            "runtime_root": "/work/mcp-server/runtime",
+            "gateway": {"server_dir": "gateway/servers.d"},
+            "servers": {
+                "filesystem": {},
+                "git": {"extra_args": ["--allow-remote-read"]},
+                "exec": {"extra_args": ["--default-timeout-ms", "120000"]},
+            },
+        }
+        fleet = {
+            "components": {
+                "filesystem": {"binary": "rust-mcp-filesystem"},
+                "git": {"binary": "rust-mcp-git"},
+                "exec": {"binary": "rust-mcp-exec"},
+            }
+        }
+        first = fleetctl.render_plan_data(host, fleet)
+        second = fleetctl.render_plan_data(host, fleet)
+        self.assertEqual(first, second)
+        self.assertEqual(first["schema_version"], 1)
+        self.assertEqual(first["host_id"], "test-host")
+        self.assertEqual(len(first["outputs"]), 5)
+        paths = {item["relative_path"] for item in first["outputs"]}
+        self.assertEqual(
+            paths,
+            {
+                "gateway/servers.d/filesystem.yaml",
+                "gateway/servers.d/git.yaml",
+                "gateway/servers.d/exec.yaml",
+                "studio/studio.toml",
+                "tunnel-client/config.yaml",
+            },
+        )
+        effects = {item["surface"]: item["effects"] for item in first["outputs"]}
+        self.assertEqual(effects["gateway.git"], ["gateway_reload"])
+        self.assertEqual(effects["studio.config"], ["studio_restart"])
+        self.assertEqual(effects["tunnel.config"], ["tunnel_restart"])
+        for item in first["outputs"]:
+            payload = base64.b64decode(item["content_b64"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), item["sha256"])
+            self.assertEqual(item["ownership"], "fleet_managed")
+            self.assertNotIn("target/release", payload.decode())
 
     def test_component_path_uses_host_source_root(self) -> None:
         host = {"source_root": "/work/mcp-server"}

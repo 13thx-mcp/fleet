@@ -2,6 +2,10 @@
 
 Local fleet metadata and safety tooling for keeping the MCP stack consistent across Aira and Mirin.
 
+## Pure runtime render plan
+
+`fleetctl render-plan --host <host> --json` emits the deterministic Fleet-owned desired runtime surfaces without writing them. Each output contains a trusted runtime-relative destination, SHA-256, base64-encoded exact bytes, ownership class, and lifecycle effects. Studio M5.9A consumes this contract for drift reconciliation instead of reimplementing Fleet rendering.
+
 ## Scope
 
 This directory is the control-plane source for **desired component identity and host-specific rendering**, not a runtime state store. It intentionally does not contain tunnel credentials, PIDs, logs, build outputs, or node_modules.

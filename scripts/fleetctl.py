@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -442,6 +443,67 @@ def gateway_outputs(host_name: str) -> dict[Path, str]:
     return outputs
 
 
+def render_plan_data(host: dict[str, Any], fleet: dict[str, Any]) -> dict[str, Any]:
+    runtime_root = Path(host["runtime_root"]).resolve()
+    outputs: list[dict[str, Any]] = []
+
+    def add(surface: str, destination: Path, content: str, effects: list[str]) -> None:
+        resolved = destination.resolve()
+        try:
+            relative = resolved.relative_to(runtime_root)
+        except ValueError as exc:
+            raise RuntimeError(f"render-plan destination escapes runtime_root: {resolved}") from exc
+        encoded = content.encode("utf-8")
+        outputs.append({
+            "surface": surface,
+            "relative_path": relative.as_posix(),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "content_encoding": "base64",
+            "content_b64": base64.b64encode(encoded).decode("ascii"),
+            "ownership": "fleet_managed",
+            "effects": effects,
+        })
+
+    server_dir = (runtime_root / host["gateway"]["server_dir"]).resolve()
+    for name in ("filesystem", "git", "exec"):
+        add(
+            f"gateway.{name}",
+            server_dir / f"{name}.yaml",
+            render_server(name, host["servers"][name], host, fleet),
+            ["gateway_reload"],
+        )
+
+    add(
+        "studio.config",
+        runtime_root / "studio" / "studio.toml",
+        studio_config_text(host),
+        ["studio_restart"],
+    )
+    add(
+        "tunnel.config",
+        runtime_root / "tunnel-client" / "config.yaml",
+        tunnel_config_text(host),
+        ["tunnel_restart"],
+    )
+
+    outputs.sort(key=lambda item: (item["relative_path"], item["surface"]))
+    return {
+        "schema_version": 1,
+        "host_id": host["host_id"],
+        "runtime_root": str(runtime_root),
+        "outputs": outputs,
+    }
+
+
+def render_plan(host_name: str, json_output: bool) -> int:
+    if not json_output:
+        raise RuntimeError("render-plan currently requires --json")
+    fleet = load_toml(FLEET_CONFIG)
+    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    print(json.dumps(render_plan_data(host, fleet), sort_keys=True, separators=(",", ":")))
+    return 0
+
+
 def render_gateway(host_name: str, check: bool) -> int:
     mismatches: list[Path] = []
     for path, desired in gateway_outputs(host_name).items():
@@ -665,6 +727,9 @@ def parse_args() -> argparse.Namespace:
         cmd.add_argument("--host", required=True)
     doctor_parser = sub.choices["doctor"]
     doctor_parser.add_argument("--require-remotes", action="store_true")
+    render_plan_parser = sub.add_parser("render-plan")
+    render_plan_parser.add_argument("--host", required=True)
+    render_plan_parser.add_argument("--json", action="store_true")
     render = sub.add_parser("render-gateway")
     render.add_argument("--host", required=True)
     render.add_argument("--check", action="store_true")
@@ -697,6 +762,8 @@ def main() -> int:
             return doctor(collect(args.host), args.require_remotes)
         if args.command == "snapshot":
             return snapshot(args.host)
+        if args.command == "render-plan":
+            return render_plan(args.host, args.json)
         if args.command == "render-gateway":
             return render_gateway(args.host, args.check)
         if args.command == "render-studio":
