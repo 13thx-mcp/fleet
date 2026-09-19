@@ -81,6 +81,29 @@ Projects live directly under `mcp-server/<project>`. `mcp-server/bin` is reserve
 
 Project-owned source repositories are hosted under the private GitHub organization `13thx-mcp`. `tunnel-client` is the exception: it tracks the official `openai/tunnel-client` releases directly.
 
+## Studio external activation
+
+M5.10 uses the deployed Fleet bundle as a trusted external launcher for Studio self-update. Studio supplies only a server-generated transaction ID and its own PID:
+
+```bash
+python3 scripts/fleetctl.py studio-activate --host <host> --transaction <id> --parent-pid <pid>
+```
+
+The launcher reads durable metadata from `runtime/studio/data/self-update/`, waits for the old Studio process to exit, promotes a verified candidate under `runtime/studio/releases/`, atomically repoints `runtime/studio/current`, launches the matching backend plus `web/dist`, verifies `/health` and version, and rolls back on failure.
+
+The managed layout is:
+
+```text
+runtime/studio/
+├── current -> releases/vX.Y.Z
+├── releases/vX.Y.Z/{mcp-studio,web/dist/...}
+├── studio.toml
+├── data/
+└── mcp-studio   # legacy/bootstrap fallback
+```
+
+`studio.toml` and `data/` remain host-local. `fleetctl install --component studio` is bootstrap-only after M5.10: once `runtime/studio/current` exists it refuses to overwrite the legacy fallback binary.
+
 ## Runtime-only control bundle
 
 `deploy-control` copies the fleet manifest, selected host profile, documentation, and `fleetctl.py` into `mcp-server/runtime/fleet`. Source repositories are resolved from `host.source_root`; Rust MCP binaries are installed into the flat `host.bin_root`; non-MCP services such as Studio use `install_scope = "runtime"` and install beneath `host.runtime_root`. Generated operational state remains under `host.runtime_root`.

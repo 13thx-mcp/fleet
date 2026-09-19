@@ -695,6 +695,14 @@ def install_component(host_name: str, component_name: str) -> int:
         return 2
     install_dir = component_install_dir(component_name, component, host)
     install_dir.mkdir(parents=True, exist_ok=True)
+    if component_name == "studio":
+        current = install_dir / "current"
+        if current.exists() or current.is_symlink():
+            print(
+                "fleetctl: Studio source install is bootstrap-only once runtime/studio/current exists",
+                file=sys.stderr,
+            )
+            return 2
     destination = install_dir / component["binary"]
     fd, temp_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=install_dir)
     os.close(fd)
