@@ -408,6 +408,63 @@ server_dir = "gateway/servers.d"
         with self.assertRaises(RuntimeError):
             fleetctl.validate_self_update_metadata(metadata, "txn-studio-good", 124)
 
+    def test_studio_contract_requires_process_bound_protocol_v2(self) -> None:
+        contract = fleetctl.studio_contract()
+        self.assertEqual(contract["activation_protocol"], 2)
+        self.assertIn(2, contract["schema_versions"])
+        self.assertTrue(contract["process_bound_readiness"])
+        self.assertTrue(contract["cross_process_lock"])
+
+    def test_self_update_revision_rejects_stale_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            path = Path(temp_name) / "state.json"
+            current = {
+                "journal_revision": 1,
+                "phase": "external_activating",
+            }
+            fleetctl.write_json_atomic(path, current)
+            stale = dict(current)
+            stale["journal_revision"] = 0
+            with self.assertRaises(RuntimeError):
+                fleetctl.update_self_update_metadata(
+                    path, stale, "external_activated"
+                )
+            self.assertEqual(
+                fleetctl.read_regular_json(path)["phase"],
+                "external_activating",
+            )
+
+    def test_activation_lock_rejects_concurrent_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            studio_root = Path(temp_name) / "studio"
+            with fleetctl.studio_activation_lock(studio_root):
+                with self.assertRaises(RuntimeError):
+                    with fleetctl.studio_activation_lock(studio_root):
+                        pass
+
+    def test_readiness_rejects_unrelated_health_when_spawned_process_exited(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            release = root / "release"
+            (release / "web/dist").mkdir(parents=True)
+            (release / "mcp-studio").write_bytes(b"binary")
+            (release / "web/dist/index.html").write_text("web")
+            fingerprint = fleetctl.self_update_tree_fingerprint(release)
+            proc = mock.Mock()
+            proc.poll.return_value = 1
+            proc.pid = 5401
+            with mock.patch.object(fleetctl, "studio_health", return_value=True):
+                self.assertFalse(
+                    fleetctl.wait_for_spawned_studio_readiness(
+                        root,
+                        "0.5.0",
+                        proc,
+                        release,
+                        fingerprint,
+                        "release_tree",
+                    )
+                )
+
     def _self_update_fixture(self, root: Path) -> tuple[Path, str]:
         fleet_root = root / "fleet"
         runtime_root = root / "runtime"
@@ -431,7 +488,9 @@ server_dir = "gateway/servers.d"
         (candidate / "web/dist/index.html").write_text("new web")
         fingerprint = fleetctl.self_update_tree_fingerprint(candidate)
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "launcher_protocol": 2,
+            "journal_revision": 0,
             "transaction_id": tx,
             "component": "studio",
             "source_version": "0.4.0",
@@ -464,11 +523,12 @@ server_dir = "gateway/servers.d"
 
                 fake_process = mock.Mock()
                 fake_process.poll.return_value = None
+                fake_process.pid = 5001
                 with (
                     mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
                     mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
                     mock.patch.object(fleetctl, "spawn_studio", return_value=fake_process),
-                    mock.patch.object(fleetctl, "wait_for_studio_health", return_value=True),
+                    mock.patch.object(fleetctl, "wait_for_spawned_studio_readiness", return_value=True),
                 ):
                     self.assertEqual(fleetctl.studio_activate("test", tx, 999), 0)
                 studio_root = root / "runtime/studio"
@@ -498,15 +558,16 @@ server_dir = "gateway/servers.d"
                     return "0.5.0" if "releases" in path.parts else "0.4.0"
 
                 processes = [mock.Mock(), mock.Mock()]
-                for proc in processes:
+                for index, proc in enumerate(processes, start=1):
                     proc.poll.return_value = None
+                    proc.pid = 5100 + index
                 with (
                     mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
                     mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
                     mock.patch.object(fleetctl, "spawn_studio", side_effect=processes),
                     mock.patch.object(
                         fleetctl,
-                        "wait_for_studio_health",
+                        "wait_for_spawned_studio_readiness",
                         side_effect=[False, True],
                     ),
                     mock.patch.object(fleetctl, "stop_spawned_process"),
@@ -537,6 +598,7 @@ server_dir = "gateway/servers.d"
 
                 rollback_proc = mock.Mock()
                 rollback_proc.poll.return_value = None
+                rollback_proc.pid = 5201
                 with (
                     mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
                     mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
@@ -545,7 +607,7 @@ server_dir = "gateway/servers.d"
                         "spawn_studio",
                         side_effect=[OSError("forced spawn failure"), rollback_proc],
                     ),
-                    mock.patch.object(fleetctl, "wait_for_studio_health", return_value=True),
+                    mock.patch.object(fleetctl, "wait_for_spawned_studio_readiness", return_value=True),
                 ):
                     self.assertEqual(fleetctl.studio_activate("test", tx, 999), 3)
                 studio_root = root / "runtime/studio"
@@ -587,12 +649,13 @@ server_dir = "gateway/servers.d"
 
                 proc = mock.Mock()
                 proc.poll.return_value = None
+                proc.pid = 5301
                 with (
                     mock.patch.object(fleetctl, "studio_health", return_value=False),
                     mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
                     mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
                     mock.patch.object(fleetctl, "spawn_studio", return_value=proc),
-                    mock.patch.object(fleetctl, "wait_for_studio_health", return_value=True),
+                    mock.patch.object(fleetctl, "wait_for_spawned_studio_readiness", return_value=True),
                 ):
                     self.assertEqual(fleetctl.studio_activate("test", tx, 999), 0)
                 state = fleetctl.read_regular_json(metadata_path)
