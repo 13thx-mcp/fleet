@@ -10,6 +10,7 @@ import fcntl
 import os
 import platform
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -941,6 +942,42 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def activation_proof_path(studio_root: Path, transaction_id: str) -> Path:
+    return studio_root / "data" / "self-update" / f"{transaction_id}.ready.json"
+
+
+def clear_activation_proof(studio_root: Path, transaction_id: str) -> None:
+    path = activation_proof_path(studio_root, transaction_id)
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("Studio activation proof path is unsafe")
+    path.unlink()
+    fsync_dir(path.parent)
+
+
+def activation_proof_matches(
+    studio_root: Path,
+    transaction_id: str,
+    nonce: str,
+    proc: subprocess.Popen[bytes],
+) -> bool:
+    path = activation_proof_path(studio_root, transaction_id)
+    try:
+        proof = read_regular_json(path)
+        config_path = (studio_root / "studio.toml").resolve()
+        return (
+            proof.get("schema_version") == 1
+            and proof.get("transaction_id") == transaction_id
+            and proof.get("nonce") == nonce
+            and proof.get("pid") == proc.pid
+            and Path(str(proof.get("config_path", ""))).resolve() == config_path
+            and proof.get("config_sha256") == file_sha256(config_path)
+        )
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def wait_for_spawned_studio_readiness(
     studio_root: Path,
     expected_version: str,
@@ -948,6 +985,8 @@ def wait_for_spawned_studio_readiness(
     identity_path: Path,
     expected_fingerprint: str,
     fingerprint_kind: str,
+    transaction_id: str,
+    activation_nonce: str,
 ) -> bool:
     def identity_matches() -> bool:
         try:
@@ -963,17 +1002,29 @@ def wait_for_spawned_studio_readiness(
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return False
-        if identity_matches() and studio_health(studio_root, expected_version):
+        if (
+            identity_matches()
+            and activation_proof_matches(
+                studio_root, transaction_id, activation_nonce, proc
+            )
+            and studio_health(studio_root, expected_version)
+        ):
             time.sleep(SELF_UPDATE_READY_STABILITY_SECONDS)
             return (
                 proc.poll() is None
                 and identity_matches()
+                and activation_proof_matches(
+                    studio_root, transaction_id, activation_nonce, proc
+                )
                 and studio_health(studio_root, expected_version)
             )
         time.sleep(SELF_UPDATE_POLL_SECONDS)
     return (
         proc.poll() is None
         and identity_matches()
+        and activation_proof_matches(
+            studio_root, transaction_id, activation_nonce, proc
+        )
         and studio_health(studio_root, expected_version)
     )
 
@@ -1059,14 +1110,23 @@ def minimal_studio_env() -> dict[str, str]:
     return env
 
 
-def spawn_studio(studio_root: Path, binary: Path, cwd: Path) -> subprocess.Popen[bytes]:
+def spawn_studio(
+    studio_root: Path,
+    binary: Path,
+    cwd: Path,
+    transaction_id: str,
+    activation_nonce: str,
+) -> subprocess.Popen[bytes]:
     config_path = studio_root / "studio.toml"
     if binary.is_symlink() or not binary.is_file():
         raise RuntimeError("Studio launch binary is unavailable")
+    env = minimal_studio_env()
+    env["MCP_STUDIO_ACTIVATION_TRANSACTION"] = transaction_id
+    env["MCP_STUDIO_ACTIVATION_NONCE"] = activation_nonce
     return subprocess.Popen(
         [str(binary), "--config", str(config_path)],
         cwd=cwd,
-        env=minimal_studio_env(),
+        env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -1198,7 +1258,15 @@ def rollback_studio_release(
     else:
         raise RuntimeError("unsupported Studio rollback layout")
 
-    rollback_proc = spawn_studio(studio_root, rollback_binary, rollback_cwd)
+    clear_activation_proof(studio_root, transaction_id)
+    rollback_nonce = secrets.token_hex(32)
+    rollback_proc = spawn_studio(
+        studio_root,
+        rollback_binary,
+        rollback_cwd,
+        transaction_id,
+        rollback_nonce,
+    )
     update_self_update_metadata(
         metadata_path,
         metadata,
@@ -1215,7 +1283,10 @@ def rollback_studio_release(
         identity_path,
         rollback_fingerprint,
         fingerprint_kind,
+        transaction_id,
+        rollback_nonce,
     ):
+        clear_activation_proof(studio_root, transaction_id)
         update_self_update_metadata(
             metadata_path,
             metadata,
@@ -1229,6 +1300,7 @@ def rollback_studio_release(
         return 3
 
     stop_spawned_process(rollback_proc)
+    clear_activation_proof(studio_root, transaction_id)
     update_self_update_metadata(
         metadata_path,
         metadata,
@@ -1359,7 +1431,15 @@ def _studio_activate_locked(host_name: str, transaction_id: str, parent_pid: int
         ensure_current(studio_root, target_release, transaction_id)
         switched = True
 
-        target_proc = spawn_studio(studio_root, target / "mcp-studio", target)
+        clear_activation_proof(studio_root, transaction_id)
+        target_nonce = secrets.token_hex(32)
+        target_proc = spawn_studio(
+            studio_root,
+            target / "mcp-studio",
+            target,
+            transaction_id,
+            target_nonce,
+        )
         update_self_update_metadata(
             metadata_path,
             metadata,
@@ -1375,7 +1455,10 @@ def _studio_activate_locked(host_name: str, transaction_id: str, parent_pid: int
             target,
             fingerprint,
             "release_tree",
+            transaction_id,
+            target_nonce,
         ):
+            clear_activation_proof(studio_root, transaction_id)
             update_self_update_metadata(
                 metadata_path,
                 metadata,
@@ -1387,6 +1470,7 @@ def _studio_activate_locked(host_name: str, transaction_id: str, parent_pid: int
             return 0
 
         stop_spawned_process(target_proc)
+        clear_activation_proof(studio_root, transaction_id)
         return rollback_studio_release(
             studio_root,
             metadata_path,
@@ -1401,6 +1485,10 @@ def _studio_activate_locked(host_name: str, transaction_id: str, parent_pid: int
         )
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         stop_spawned_process(target_proc)
+        try:
+            clear_activation_proof(studio_root, transaction_id)
+        except (OSError, RuntimeError):
+            pass
         print(f"fleetctl: Studio activation failed: {exc}", file=sys.stderr)
         switched = switched or current_release_target(studio_root) == target_release
         if switched:

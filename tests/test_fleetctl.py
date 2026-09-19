@@ -194,9 +194,13 @@ class FleetCtlTests(unittest.TestCase):
             (release / "web/dist/index.html").write_text("web")
             fingerprint = fleetctl.self_update_tree_fingerprint(release)
             proc = mock.Mock()
-            proc.poll.return_value = 1
+            proc.poll.return_value = None
             proc.pid = 5401
-            with mock.patch.object(fleetctl, "studio_health", return_value=True):
+            with (
+                mock.patch.object(fleetctl, "studio_health", return_value=True),
+                mock.patch.object(fleetctl, "SELF_UPDATE_HEALTH_TIMEOUT_SECONDS", 0.01),
+                mock.patch.object(fleetctl, "SELF_UPDATE_POLL_SECONDS", 0.001),
+            ):
                 self.assertFalse(
                     fleetctl.wait_for_spawned_studio_readiness(
                         root,
@@ -205,6 +209,77 @@ class FleetCtlTests(unittest.TestCase):
                         release,
                         fingerprint,
                         "release_tree",
+                        "txn-studio-unrelated",
+                        "a" * 64,
+                    )
+                )
+
+    def test_readiness_requires_matching_spawned_process_nonce_and_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            studio_root = root / "studio"
+            release = root / "release"
+            (release / "web/dist").mkdir(parents=True)
+            (release / "mcp-studio").write_bytes(b"binary")
+            (release / "web/dist/index.html").write_text("web")
+            (studio_root / "data/self-update").mkdir(parents=True)
+            config = studio_root / "studio.toml"
+            config.write_text('[server]\nlisten_addr = "127.0.0.1:18100"\n')
+            fingerprint = fleetctl.self_update_tree_fingerprint(release)
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            proc.pid = 5501
+            tx = "txn-studio-proof"
+            nonce = "b" * 64
+            fleetctl.write_json_atomic(
+                fleetctl.activation_proof_path(studio_root, tx),
+                {
+                    "schema_version": 1,
+                    "transaction_id": tx,
+                    "nonce": nonce,
+                    "pid": proc.pid,
+                    "config_path": str(config.resolve()),
+                    "config_sha256": fleetctl.file_sha256(config),
+                },
+            )
+            with (
+                mock.patch.object(fleetctl, "studio_health", return_value=True),
+                mock.patch.object(fleetctl, "SELF_UPDATE_READY_STABILITY_SECONDS", 0.0),
+            ):
+                self.assertTrue(
+                    fleetctl.wait_for_spawned_studio_readiness(
+                        studio_root,
+                        "0.5.0",
+                        proc,
+                        release,
+                        fingerprint,
+                        "release_tree",
+                        tx,
+                        nonce,
+                    )
+                )
+            wrong_pid = fleetctl.read_regular_json(
+                fleetctl.activation_proof_path(studio_root, tx)
+            )
+            wrong_pid["pid"] = 9999
+            fleetctl.write_json_atomic(
+                fleetctl.activation_proof_path(studio_root, tx), wrong_pid
+            )
+            with (
+                mock.patch.object(fleetctl, "studio_health", return_value=True),
+                mock.patch.object(fleetctl, "SELF_UPDATE_HEALTH_TIMEOUT_SECONDS", 0.01),
+                mock.patch.object(fleetctl, "SELF_UPDATE_POLL_SECONDS", 0.001),
+            ):
+                self.assertFalse(
+                    fleetctl.wait_for_spawned_studio_readiness(
+                        studio_root,
+                        "0.5.0",
+                        proc,
+                        release,
+                        fingerprint,
+                        "release_tree",
+                        tx,
+                        nonce,
                     )
                 )
 
