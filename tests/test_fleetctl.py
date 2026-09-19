@@ -350,6 +350,53 @@ class FleetCtlTests(unittest.TestCase):
         component = {"source_dir": "gateway"}
         self.assertEqual(fleetctl.component_path(component, host), Path('/work/mcp-server/gateway'))
 
+    def test_studio_source_install_is_bootstrap_only_after_versioned_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            fleet_root = root / "fleet"
+            source_root = root / "source"
+            runtime_root = root / "runtime"
+            bin_root = root / "bin"
+            (fleet_root / "hosts").mkdir(parents=True)
+            (source_root / "studio/target/release").mkdir(parents=True)
+            runtime_root.mkdir()
+            bin_root.mkdir()
+            source_binary = source_root / "studio/target/release/mcp-studio"
+            source_binary.write_bytes(b"studio")
+            current = runtime_root / "studio/current"
+            current.parent.mkdir(parents=True)
+            current.symlink_to("releases/v1.0.0")
+
+            (fleet_root / "fleet.toml").write_text(
+                """
+[components.studio]
+kind = "git"
+install_scope = "runtime"
+install_dir = "studio"
+source_dir = "studio"
+build_output = "target/release/mcp-studio"
+binary = "mcp-studio"
+"""
+            )
+            (fleet_root / "hosts/test.toml").write_text(
+                f"""
+source_root = "{source_root}"
+runtime_root = "{runtime_root}"
+bin_root = "{bin_root}"
+"""
+            )
+
+            original_fleet_dir = fleetctl.FLEET_DIR
+            original_fleet_config = fleetctl.FLEET_CONFIG
+            fleetctl.FLEET_DIR = fleet_root
+            fleetctl.FLEET_CONFIG = fleet_root / "fleet.toml"
+            try:
+                self.assertEqual(fleetctl.install_component("test", "studio"), 2)
+                self.assertFalse((runtime_root / "studio/mcp-studio").exists())
+            finally:
+                fleetctl.FLEET_DIR = original_fleet_dir
+                fleetctl.FLEET_CONFIG = original_fleet_config
+
     def test_component_install_scope_separates_mcp_bin_and_services(self) -> None:
         host = {
             "bin_root": "/work/mcp-server/bin",
