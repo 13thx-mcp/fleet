@@ -5,6 +5,8 @@ import argparse
 import base64
 import hashlib
 import json
+import contextlib
+import fcntl
 import os
 import platform
 import re
@@ -729,8 +731,11 @@ def snapshot(host_name: str) -> int:
 
 
 
-SELF_UPDATE_SCHEMA_VERSION = 1
+SELF_UPDATE_SCHEMA_VERSION = 2
+SELF_UPDATE_SUPPORTED_SCHEMA_VERSIONS = {1, 2}
+SELF_UPDATE_ACTIVATION_PROTOCOL = 2
 SELF_UPDATE_HEALTH_TIMEOUT_SECONDS = 20.0
+SELF_UPDATE_READY_STABILITY_SECONDS = 0.25
 SELF_UPDATE_PARENT_EXIT_TIMEOUT_SECONDS = 15.0
 SELF_UPDATE_POLL_SECONDS = 0.2
 SELF_UPDATE_MAX_FILES = 8192
@@ -900,6 +905,88 @@ def current_release_target(studio_root: Path) -> str | None:
     return release_name
 
 
+def studio_contract() -> dict[str, Any]:
+    return {
+        "activation_protocol": SELF_UPDATE_ACTIVATION_PROTOCOL,
+        "schema_versions": sorted(SELF_UPDATE_SUPPORTED_SCHEMA_VERSIONS),
+        "process_bound_readiness": True,
+        "cross_process_lock": True,
+    }
+
+
+@contextlib.contextmanager
+def studio_activation_lock(studio_root: Path):
+    state_root = studio_root / "data" / "self-update"
+    state_root.mkdir(parents=True, exist_ok=True)
+    lock_path = state_root / ".activation.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("Studio activation is already owned by another Fleet launcher") from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(64 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def wait_for_spawned_studio_readiness(
+    studio_root: Path,
+    expected_version: str,
+    proc: subprocess.Popen[bytes],
+    identity_path: Path,
+    expected_fingerprint: str,
+    fingerprint_kind: str,
+) -> bool:
+    def identity_matches() -> bool:
+        try:
+            if fingerprint_kind == "release_tree":
+                return self_update_tree_fingerprint(identity_path) == expected_fingerprint
+            if fingerprint_kind == "binary":
+                return file_sha256(identity_path) == expected_fingerprint
+        except (OSError, RuntimeError):
+            return False
+        return False
+
+    deadline = time.monotonic() + SELF_UPDATE_HEALTH_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        if identity_matches() and studio_health(studio_root, expected_version):
+            time.sleep(SELF_UPDATE_READY_STABILITY_SECONDS)
+            return (
+                proc.poll() is None
+                and identity_matches()
+                and studio_health(studio_root, expected_version)
+            )
+        time.sleep(SELF_UPDATE_POLL_SECONDS)
+    return (
+        proc.poll() is None
+        and identity_matches()
+        and studio_health(studio_root, expected_version)
+    )
+
+
+def ensure_current(studio_root: Path, release_name: str, transaction_id: str) -> None:
+    try:
+        atomic_set_current(studio_root, release_name, transaction_id)
+    except OSError:
+        if current_release_target(studio_root) != release_name:
+            raise
+        fsync_dir(studio_root)
+
+
 def atomic_set_current(studio_root: Path, release_name: str, transaction_id: str) -> None:
     safe_release_target(studio_root, release_name)
     current = studio_root / "current"
@@ -1005,10 +1092,25 @@ def update_self_update_metadata(
     *,
     error: str | None = None,
     rollback_succeeded: bool | None = None,
+    launcher_owner: str | None = None,
+    launched_pid: int | None = None,
+    launched_release_fingerprint: str | None = None,
 ) -> None:
+    current = read_regular_json(path)
+    current_revision = int(current.get("journal_revision", 0))
+    expected_revision = int(metadata.get("journal_revision", 0))
+    if current_revision != expected_revision:
+        raise RuntimeError("stale Studio self-update journal revision")
+    metadata["journal_revision"] = expected_revision + 1
     metadata["phase"] = phase
     metadata["error"] = error
     metadata["rollback_succeeded"] = rollback_succeeded
+    if launcher_owner is not None:
+        metadata["launcher_owner"] = launcher_owner
+    if launched_pid is not None:
+        metadata["launched_pid"] = launched_pid
+    if launched_release_fingerprint is not None:
+        metadata["launched_release_fingerprint"] = launched_release_fingerprint
     metadata["updated_at_ms"] = int(time.time() * 1000)
     write_json_atomic(path, metadata)
 
@@ -1018,8 +1120,11 @@ def validate_self_update_metadata(
     transaction_id: str,
     parent_pid: int,
 ) -> None:
-    if metadata.get("schema_version") != SELF_UPDATE_SCHEMA_VERSION:
+    schema_version = metadata.get("schema_version")
+    if schema_version not in SELF_UPDATE_SUPPORTED_SCHEMA_VERSIONS:
         raise RuntimeError("unsupported Studio self-update metadata schema")
+    if schema_version == SELF_UPDATE_SCHEMA_VERSION and metadata.get("launcher_protocol") != SELF_UPDATE_ACTIVATION_PROTOCOL:
+        raise RuntimeError("incompatible Studio/Fleet activation protocol")
     if metadata.get("transaction_id") != transaction_id:
         raise RuntimeError("Studio self-update transaction identity mismatch")
     if metadata.get("component") != "studio":
@@ -1030,6 +1135,7 @@ def validate_self_update_metadata(
         "activation_pending",
         "external_activating",
         "external_activated",
+        "rolling_back",
     }:
         raise RuntimeError("Studio self-update transaction is not activation-pending")
 
@@ -1044,12 +1150,14 @@ def rollback_studio_release(
     legacy_binary: Path,
     source_version: str,
     reason: str,
+    launcher_owner: str,
 ) -> int:
     update_self_update_metadata(
         metadata_path,
         metadata,
         "rolling_back",
         error=reason,
+        launcher_owner=launcher_owner,
     )
     if previous_layout == "versioned":
         if previous_release is None:
@@ -1059,24 +1167,64 @@ def rollback_studio_release(
                 "rollback_failed",
                 error="rollback_previous_release_missing",
                 rollback_succeeded=False,
+                launcher_owner=launcher_owner,
             )
             return 4
-        atomic_set_current(studio_root, previous_release, transaction_id)
-        rollback_binary = studio_root / "releases" / previous_release / "mcp-studio"
-        rollback_cwd = rollback_binary.parent
-    else:
-        clear_current(studio_root)
+        ensure_current(studio_root, previous_release, transaction_id)
+        rollback_root = studio_root / "releases" / previous_release
+        rollback_binary = rollback_root / "mcp-studio"
+        rollback_cwd = rollback_root
+        rollback_fingerprint = str(metadata.get("previous_release_fingerprint") or "")
+        if not rollback_fingerprint:
+            rollback_fingerprint = self_update_tree_fingerprint(rollback_root)
+            metadata["previous_release_fingerprint"] = rollback_fingerprint
+        fingerprint_kind = "release_tree"
+        identity_path = rollback_root
+    elif previous_layout == "legacy_flat":
+        try:
+            clear_current(studio_root)
+        except OSError:
+            if current_release_target(studio_root) is not None:
+                raise
+            fsync_dir(studio_root)
         rollback_binary = legacy_binary
         rollback_cwd = studio_root
+        rollback_fingerprint = str(metadata.get("previous_release_fingerprint") or "")
+        if not rollback_fingerprint:
+            rollback_fingerprint = file_sha256(rollback_binary)
+            metadata["previous_release_fingerprint"] = rollback_fingerprint
+        fingerprint_kind = "binary"
+        identity_path = rollback_binary
+    else:
+        raise RuntimeError("unsupported Studio rollback layout")
 
     rollback_proc = spawn_studio(studio_root, rollback_binary, rollback_cwd)
-    if wait_for_studio_health(studio_root, source_version):
+    update_self_update_metadata(
+        metadata_path,
+        metadata,
+        "rolling_back",
+        error=reason,
+        launcher_owner=launcher_owner,
+        launched_pid=rollback_proc.pid,
+        launched_release_fingerprint=rollback_fingerprint,
+    )
+    if wait_for_spawned_studio_readiness(
+        studio_root,
+        source_version,
+        rollback_proc,
+        identity_path,
+        rollback_fingerprint,
+        fingerprint_kind,
+    ):
         update_self_update_metadata(
             metadata_path,
             metadata,
             "rolled_back",
             error=reason,
             rollback_succeeded=True,
+            launcher_owner=launcher_owner,
+            launched_pid=rollback_proc.pid,
+            launched_release_fingerprint=rollback_fingerprint,
         )
         return 3
 
@@ -1087,17 +1235,21 @@ def rollback_studio_release(
         "rollback_failed",
         error="rollback_health_failed",
         rollback_succeeded=False,
+        launcher_owner=launcher_owner,
+        launched_pid=rollback_proc.pid,
+        launched_release_fingerprint=rollback_fingerprint,
     )
     return 4
 
 
-def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int:
+def _studio_activate_locked(host_name: str, transaction_id: str, parent_pid: int) -> int:
     host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
     runtime_root = Path(host["runtime_root"]).resolve()
     studio_root = runtime_root / "studio"
     metadata_path = self_update_transaction_path(host, transaction_id)
     metadata = read_regular_json(metadata_path)
     validate_self_update_metadata(metadata, transaction_id, parent_pid)
+    launcher_owner = f"fleet:{os.getpid()}:{transaction_id}"
 
     source_version = str(metadata["source_version"])
     target_version = str(metadata["target_version"])
@@ -1110,13 +1262,6 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
     candidate = candidate_target(studio_root, transaction_id, candidate_name)
     target = safe_release_target(studio_root, target_release)
 
-    # Resume-safe fast path after a launcher interruption.
-    if current_release_target(studio_root) == target_release and target.is_dir():
-        validate_self_update_release(target, target_version, fingerprint)
-        if studio_health(studio_root, target_version):
-            update_self_update_metadata(metadata_path, metadata, "completed")
-            return 0
-
     if metadata["phase"] == "activation_pending":
         if not wait_for_pid_exit(parent_pid, SELF_UPDATE_PARENT_EXIT_TIMEOUT_SECONDS):
             update_self_update_metadata(
@@ -1124,10 +1269,16 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
                 metadata,
                 "activation_failed",
                 error="parent_exit_timeout",
+                launcher_owner=launcher_owner,
             )
             return 2
 
-    update_self_update_metadata(metadata_path, metadata, "external_activating")
+    update_self_update_metadata(
+        metadata_path,
+        metadata,
+        "external_activating",
+        launcher_owner=launcher_owner,
+    )
 
     legacy_binary = studio_root / "mcp-studio"
     previous_layout = metadata.get("previous_layout")
@@ -1148,7 +1299,18 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
             return 2
         metadata["previous_layout"] = previous_layout
         metadata["previous_release"] = previous_release
-        write_json_atomic(metadata_path, metadata)
+        if previous_layout == "versioned" and isinstance(previous_release, str):
+            metadata["previous_release_fingerprint"] = self_update_tree_fingerprint(
+                studio_root / "releases" / previous_release
+            )
+        elif previous_layout == "legacy_flat":
+            metadata["previous_release_fingerprint"] = file_sha256(legacy_binary)
+        update_self_update_metadata(
+            metadata_path,
+            metadata,
+            "external_activating",
+            launcher_owner=launcher_owner,
+        )
 
     if previous_layout == "versioned":
         if not isinstance(previous_release, str):
@@ -1194,13 +1356,34 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
             os.replace(candidate, target)
             fsync_dir(releases)
 
-        atomic_set_current(studio_root, target_release, transaction_id)
+        ensure_current(studio_root, target_release, transaction_id)
         switched = True
-        update_self_update_metadata(metadata_path, metadata, "external_activated")
 
         target_proc = spawn_studio(studio_root, target / "mcp-studio", target)
-        if wait_for_studio_health(studio_root, target_version):
-            update_self_update_metadata(metadata_path, metadata, "completed")
+        update_self_update_metadata(
+            metadata_path,
+            metadata,
+            "external_activated",
+            launcher_owner=launcher_owner,
+            launched_pid=target_proc.pid,
+            launched_release_fingerprint=fingerprint,
+        )
+        if wait_for_spawned_studio_readiness(
+            studio_root,
+            target_version,
+            target_proc,
+            target,
+            fingerprint,
+            "release_tree",
+        ):
+            update_self_update_metadata(
+                metadata_path,
+                metadata,
+                "completed",
+                launcher_owner=launcher_owner,
+                launched_pid=target_proc.pid,
+                launched_release_fingerprint=fingerprint,
+            )
             return 0
 
         stop_spawned_process(target_proc)
@@ -1214,10 +1397,12 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
             legacy_binary,
             source_version,
             "target_health_failed",
+            launcher_owner,
         )
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         stop_spawned_process(target_proc)
         print(f"fleetctl: Studio activation failed: {exc}", file=sys.stderr)
+        switched = switched or current_release_target(studio_root) == target_release
         if switched:
             try:
                 return rollback_studio_release(
@@ -1230,6 +1415,7 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
                     legacy_binary,
                     source_version,
                     "launcher_activation_failed",
+                    launcher_owner,
                 )
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as rollback_exc:
                 update_self_update_metadata(
@@ -1238,6 +1424,7 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
                     "rollback_failed",
                     error="rollback_exception",
                     rollback_succeeded=False,
+                    launcher_owner=launcher_owner,
                 )
                 print(
                     f"fleetctl: Studio rollback failed after launcher exception: {rollback_exc}",
@@ -1249,8 +1436,17 @@ def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int
             metadata,
             "activation_failed",
             error="launcher_activation_failed",
+            launcher_owner=launcher_owner,
         )
         return 2
+
+
+def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int:
+    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    runtime_root = Path(host["runtime_root"]).resolve()
+    studio_root = runtime_root / "studio"
+    with studio_activation_lock(studio_root):
+        return _studio_activate_locked(host_name, transaction_id, parent_pid)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1261,6 +1457,8 @@ def parse_args() -> argparse.Namespace:
         cmd.add_argument("--host", required=True)
     doctor_parser = sub.choices["doctor"]
     doctor_parser.add_argument("--require-remotes", action="store_true")
+    studio_contract_parser = sub.add_parser("studio-contract")
+    studio_contract_parser.add_argument("--json", action="store_true")
     studio_activate_parser = sub.add_parser("studio-activate")
     studio_activate_parser.add_argument("--host", required=True)
     studio_activate_parser.add_argument("--transaction", required=True)
@@ -1300,6 +1498,12 @@ def main() -> int:
             return doctor(collect(args.host), args.require_remotes)
         if args.command == "snapshot":
             return snapshot(args.host)
+        if args.command == "studio-contract":
+            if args.json:
+                print(json.dumps(studio_contract(), sort_keys=True))
+            else:
+                print(f"Studio activation protocol v{SELF_UPDATE_ACTIVATION_PROTOCOL}")
+            return 0
         if args.command == "studio-activate":
             return studio_activate(args.host, args.transaction, args.parent_pid)
         if args.command == "render-plan":
