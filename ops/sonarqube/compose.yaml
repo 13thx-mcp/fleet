@@ -1,0 +1,26 @@
+name: sonarqube
+
+services:
+  sonarqube:
+    image: sonarqube:26.9.0.129388-community
+    restart: unless-stopped
+    env_file:
+      - ${SONARQUBE_RUNTIME_ENV:?set SONARQUBE_RUNTIME_ENV}
+    ports:
+      - "${SONARQUBE_BIND_ADDRESS:-127.0.0.1}:9000:9000"
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_extensions:/opt/sonarqube/extensions
+      - sonarqube_logs:/opt/sonarqube/logs
+    networks:
+      - shared_services
+
+networks:
+  shared_services:
+    external: true
+    name: ophiuchus-network
+
+volumes:
+  sonarqube_data:
+  sonarqube_extensions:
+  sonarqube_logs:

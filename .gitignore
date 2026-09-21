@@ -2,5 +2,6 @@ state/
 __pycache__/
 *.pyc
 .DS_Store
+.gitflow/
 hosts/*.toml
 !hosts/*.example.toml

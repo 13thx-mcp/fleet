@@ -41,6 +41,20 @@ class FleetCtlTests(unittest.TestCase):
                 ["machine-specific host path", "tunnel identity outside test/example"],
             )
 
+    def test_source_hygiene_allows_generated_secrets_but_rejects_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            source = root / "bootstrap.py"
+            generated = "pass" + "word = secrets.token_urlsafe(36)\n"
+            source.write_text(generated)
+            self.assertEqual(source_hygiene.violations_for(source, root), [])
+            literal = "pass" + "word = \"" + "abcdefghijklmnop" + "\"\n"
+            source.write_text(literal)
+            self.assertEqual(
+                source_hygiene.violations_for(source, root),
+                ["probable credential assignment"],
+            )
+
     def test_runtime_host_profile_is_authority_without_source_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)
@@ -120,13 +134,15 @@ server_dir = "gateway/servers.d"
             root = Path(temp_name)
             fleet_root = root / "fleet"
             runtime_root = root / "runtime"
+            bin_root = root / "bin"
             runtime_host = runtime_root / "fleet/hosts/aira.toml"
             fleet_root.mkdir()
             runtime_host.parent.mkdir(parents=True)
+            (fleet_root / "VERSION").write_text("1.2.3\n")
             (fleet_root / "fleet.toml").write_text('fleet_name = "test"\n')
             (fleet_root / "README.md").write_text("test fleet\n")
             runtime_host.write_text(
-                f'host_id = "aira"\nruntime_root = "{runtime_root}"\n'
+                f'host_id = "aira"\nruntime_root = "{runtime_root}"\nbin_root = "{bin_root}"\n'
             )
             original_bytes = runtime_host.read_bytes()
 
@@ -210,6 +226,7 @@ server_dir = "gateway/servers.d"
 
     def test_generated_runtime_configs_use_bin_paths(self) -> None:
         host = {
+            "host_id": "test-host",
             "workspace_root": "/work",
             "source_root": "/work/mcp-server",
             "bin_root": "/work/mcp-server/bin",
@@ -294,6 +311,57 @@ server_dir = "gateway/servers.d"
             rendered,
         )
         self.assertNotIn('tunnel_id: "aira"', rendered)
+    def test_render_external_gateway_child_without_component(self) -> None:
+        host = {
+            "workspace_root": "/work",
+            "bin_root": "/work/bin",
+        }
+        fleet = {"components": {}}
+        rendered = fleetctl.render_server(
+            "sonarqube",
+            {
+                "enabled": False,
+                "command": "/work/bin/docker",
+                "args": ["run", "--rm", "-i", "sonarsource/sonarqube-mcp:1.27.0.4335"],
+                "timeout_ms": 60000,
+            },
+            host,
+            fleet,
+        )
+        self.assertIn('command: "/work/bin/docker"', rendered)
+        self.assertIn('enabled: false', rendered)
+        self.assertIn('sonarsource/sonarqube-mcp:1.27.0.4335', rendered)
+        self.assertNotIn('--root', rendered)
+
+    def test_render_trusted_launcher_under_bin_root(self) -> None:
+        host = {
+            "workspace_root": "/work",
+            "bin_root": "/work/bin",
+        }
+        rendered = fleetctl.render_server(
+            "sonarqube",
+            {
+                "enabled": True,
+                "launcher": "sonarqube-mcp",
+                "args": ["/run/secrets/sonarqube-mcp.env"],
+                "timeout_ms": 60000,
+            },
+            host,
+            {"components": {}},
+        )
+        self.assertIn('command: "/work/bin/sonarqube-mcp"', rendered)
+        self.assertIn('  - "/run/secrets/sonarqube-mcp.env"', rendered)
+        self.assertNotIn('/usr/local/bin/docker', rendered)
+        self.assertNotIn('sonarsource/sonarqube-mcp', rendered)
+
+    def test_sonarqube_launcher_pins_read_only_image_digest(self) -> None:
+        launcher = (fleetctl.LAUNCHERS_DIR / "sonarqube-mcp").read_text()
+        self.assertIn("SONARQUBE_READ_ONLY=true", launcher)
+        self.assertIn(
+            "sonarsource/sonarqube-mcp@sha256:21bb7bf785a8c9cbe19553f6957d83ef45138926bbb15ca9e1fc4895e5026b6f",
+            launcher,
+        )
+        self.assertNotIn(":1.27.0.4335", launcher)
 
     def test_render_plan_is_deterministic_pure_and_root_relative(self) -> None:
         host = {
@@ -374,6 +442,42 @@ server_dir = "gateway/servers.d"
         }
         with self.assertRaises(RuntimeError):
             fleetctl.gateway_policy_text(host)
+
+    def test_deploy_control_installs_complete_runtime_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            source = root / "source"
+            runtime = root / "runtime"
+            bin_root = root / "bin"
+            (source / "launchers").mkdir(parents=True)
+            (runtime / "fleet/hosts").mkdir(parents=True)
+            (source / "VERSION").write_text("1.2.3\n")
+            (source / "fleet.toml").write_text("schema_version = 2\n")
+            (source / "README.md").write_text("fleet\n")
+            (source / "launchers/test-launcher").write_text("#!/bin/sh\n")
+            (runtime / "fleet/hosts/test.toml").write_text(
+                f'host_id = "test"\nruntime_root = "{runtime}"\n'
+                f'bin_root = "{bin_root}"\n[servers.test]\n'
+                'launcher = "test-launcher"\n'
+            )
+
+            with (
+                mock.patch.object(fleetctl, "FLEET_DIR", source),
+                mock.patch.object(fleetctl, "FLEET_CONFIG", source / "fleet.toml"),
+                mock.patch.object(fleetctl, "LAUNCHERS_DIR", source / "launchers"),
+            ):
+                self.assertEqual(fleetctl.deploy_control("test"), 0)
+
+            installed = runtime / "fleet"
+            self.assertEqual((installed / "VERSION").read_text(), "1.2.3\n")
+            self.assertEqual(
+                (installed / "launchers/test-launcher").read_text(),
+                "#!/bin/sh\n",
+            )
+            self.assertTrue(
+                (installed / "launchers/test-launcher").stat().st_mode & 0o111
+            )
+            self.assertEqual((bin_root / "test-launcher").read_text(), "#!/bin/sh\n")
 
     def test_self_update_tree_fingerprint_is_deterministic_and_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:

@@ -23,6 +23,7 @@ BEARER_RE = re.compile(
 SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)(?:api[_-]?key|token|secret|password)\s*[:=]\s*[\"']?[A-Za-z0-9._-]{16,}"
 )
+GENERATED_SECRET_MARKERS = ("secrets.token_hex(", "secrets.token_urlsafe(", "os.urandom(")
 
 
 def source_files(root: Path) -> list[Path]:
@@ -38,6 +39,14 @@ def source_files(root: Path) -> list[Path]:
 
 def is_tunnel_example(path: Path) -> bool:
     return path.parts[0:1] == ("tests",) or path.name.endswith(".example.toml")
+
+
+def has_probable_credential_assignment(text: str) -> bool:
+    return any(
+        SECRET_ASSIGNMENT_RE.search(line)
+        and not any(marker in line for marker in GENERATED_SECRET_MARKERS)
+        for line in text.splitlines()
+    )
 
 
 def violations_for(path: Path, root: Path) -> list[str]:
@@ -58,7 +67,7 @@ def violations_for(path: Path, root: Path) -> list[str]:
         findings.append("probable OpenAI API key")
     if BEARER_RE.search(text):
         findings.append("probable bearer credential")
-    if SECRET_ASSIGNMENT_RE.search(text):
+    if has_probable_credential_assignment(text):
         findings.append("probable credential assignment")
     return findings
 

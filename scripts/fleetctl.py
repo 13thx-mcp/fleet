@@ -27,6 +27,29 @@ FLEET_DIR = Path(__file__).resolve().parents[1]
 FLEET_CONFIG = FLEET_DIR / "fleet.toml"
 TUNNEL_ID_RE = re.compile(r"^tunnel_[0-9a-f]{32}$")
 HOST_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+LAUNCHERS_DIR = FLEET_DIR / "launchers"
+
+def validate_launcher_name(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+        raise RuntimeError(f"invalid launcher name: {name}")
+    return name
+
+
+def launcher_source(name: str) -> Path:
+    name = validate_launcher_name(name)
+    path = LAUNCHERS_DIR / name
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"launcher source is unavailable or unsafe: {name}")
+    return path
+
+
+def referenced_launchers(host: dict[str, Any]) -> list[str]:
+    names = {
+        validate_launcher_name(str(server["launcher"]))
+        for server in host.get("servers", {}).values()
+        if server.get("launcher")
+    }
+    return sorted(names)
 
 
 def load_toml(path: Path) -> dict[str, Any]:
@@ -406,6 +429,22 @@ def collect(host_name: str) -> dict[str, Any]:
                 entry["local_config_exists"] = bool(local_config and (install_dir / local_config).is_file())
         components[name] = entry
 
+    launchers: dict[str, Any] = {}
+    for name in referenced_launchers(host):
+        source = launcher_source(name)
+        destination = bin_root / name
+        source_sha256 = sha256_file(source)
+        destination_sha256 = sha256_file(destination) if destination.is_file() else None
+        launchers[name] = {
+            "source_path": str(source),
+            "destination_path": str(destination),
+            "source_sha256": source_sha256,
+            "destination_sha256": destination_sha256,
+            "destination_exists": destination.is_file() and not destination.is_symlink(),
+            "executable": destination.is_file() and os.access(destination, os.X_OK),
+            "synchronized": destination_sha256 == source_sha256,
+        }
+
     return {
         "schema_version": 2,
         "fleet_name": fleet["fleet_name"],
@@ -416,6 +455,7 @@ def collect(host_name: str) -> dict[str, Any]:
         "runtime_root": str(runtime_root),
         "policy": fleet.get("policy", {}),
         "components": components,
+        "launchers": launchers,
     }
 
 
@@ -455,6 +495,14 @@ def doctor(snapshot: dict[str, Any], require_remotes: bool) -> int:
                 errors.append(f"{name}: installed runtime version could not be read")
             if not entry.get("local_config_exists"):
                 warnings.append(f"{name}: local config is missing")
+
+    for name, entry in snapshot.get("launchers", {}).items():
+        if not entry.get("destination_exists"):
+            errors.append(f"{name}: trusted launcher is missing")
+        elif not entry.get("synchronized"):
+            errors.append(f"{name}: trusted launcher differs from Fleet source")
+        elif not entry.get("executable"):
+            errors.append(f"{name}: trusted launcher is not executable")
 
     for line in errors:
         print(f"ERROR: {line}")
@@ -533,10 +581,31 @@ def gateway_policy_path(host: dict[str, Any]) -> Path:
 
 
 def render_server(name: str, server: dict[str, Any], host: dict[str, Any], fleet: dict[str, Any]) -> str:
-    component = fleet["components"][name]
-    command = Path(host["bin_root"]) / component["binary"]
-    args = ["--root", host["workspace_root"]]
-    args.extend(server.get("extra_args", []))
+    launcher_name = server.get("launcher")
+    command_override = server.get("command")
+    if launcher_name and command_override:
+        raise RuntimeError(f"server {name!r} cannot set both launcher and command")
+    if launcher_name:
+        launcher_name = validate_launcher_name(str(launcher_name))
+        launcher_source(launcher_name)
+        command = Path(host["bin_root"]).resolve() / launcher_name
+        args = [str(arg) for arg in server.get("args", [])]
+        if server.get("inject_workspace_root", False):
+            args = ["--root", host["workspace_root"], *args]
+    elif command_override:
+        command = Path(str(command_override)).expanduser()
+        if not command.is_absolute():
+            raise RuntimeError(f"external server command must be absolute: {name}")
+        args = [str(arg) for arg in server.get("args", [])]
+        if server.get("inject_workspace_root", False):
+            args = ["--root", host["workspace_root"], *args]
+    else:
+        component = fleet["components"].get(name)
+        if component is None:
+            raise RuntimeError(f"server {name!r} has no fleet component and no command override")
+        command = Path(host["bin_root"]) / component["binary"]
+        args = ["--root", host["workspace_root"]]
+        args.extend(server.get("extra_args", []))
     lines = [
         f"name: {name}",
         f"enabled: {'true' if server.get('enabled', True) else 'false'}",
@@ -567,7 +636,7 @@ def gateway_outputs(host_name: str) -> dict[Path, str]:
     host = load_host_profile(host_name)
     server_dir = (Path(host["runtime_root"]) / host["gateway"]["server_dir"]).resolve()
     outputs: dict[Path, str] = {}
-    for name in ("filesystem", "git", "exec"):
+    for name in sorted(host["servers"]):
         outputs[server_dir / f"{name}.yaml"] = render_server(name, host["servers"][name], host, fleet)
     policy = gateway_policy_text(host)
     if policy is not None:
@@ -597,7 +666,7 @@ def render_plan_data(host: dict[str, Any], fleet: dict[str, Any]) -> dict[str, A
         })
 
     server_dir = (runtime_root / host["gateway"]["server_dir"]).resolve()
-    for name in ("filesystem", "git", "exec"):
+    for name in sorted(host["servers"]):
         add(
             f"gateway.{name}",
             server_dir / f"{name}.yaml",
@@ -780,7 +849,6 @@ def tunnel_config_text(host: dict[str, Any]) -> str:
     runtime_root = Path(host["runtime_root"]).resolve()
     gateway = bin_root / "rust-mcp-gateway"
     server_dir = runtime_root / "gateway" / "servers.d"
-
     tunnel = host.get("tunnel", {})
     tunnel_id = tunnel.get("tunnel_id") if isinstance(tunnel, dict) else None
     if not isinstance(tunnel_id, str) or not TUNNEL_ID_RE.fullmatch(tunnel_id):
@@ -832,7 +900,9 @@ def deploy_control(host_name: str) -> int:
         raise RuntimeError("active host profile must be owned by runtime/fleet/hosts")
     (destination / "scripts").mkdir(parents=True, exist_ok=True)
     (destination / "hosts").mkdir(parents=True, exist_ok=True)
+    (destination / "launchers").mkdir(parents=True, exist_ok=True)
     copies = [
+        (FLEET_DIR / "VERSION", destination / "VERSION"),
         (FLEET_CONFIG, destination / "fleet.toml"),
         (Path(__file__).resolve(), destination / "scripts" / "fleetctl.py"),
         (FLEET_DIR / "README.md", destination / "README.md"),
@@ -841,7 +911,29 @@ def deploy_control(host_name: str) -> int:
         if source.resolve() != target.resolve():
             shutil.copy2(source, target)
     (destination / "scripts" / "fleetctl.py").chmod(0o755)
-    print(f"DEPLOYED: fleet control -> {destination}")
+
+    bin_root = Path(host["bin_root"]).resolve()
+    bin_root.mkdir(parents=True, exist_ok=True)
+    installed_launchers: list[str] = []
+    for name in referenced_launchers(host):
+        source = launcher_source(name)
+        bundled = destination / "launchers" / name
+        shutil.copy2(source, bundled)
+        bundled.chmod(0o755)
+        target = bin_root / name
+        fd, temp_name = tempfile.mkstemp(prefix=f".{name}.", dir=bin_root)
+        os.close(fd)
+        try:
+            shutil.copy2(source, temp_name)
+            os.chmod(temp_name, 0o755)
+            os.replace(temp_name, target)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+        installed_launchers.append(name)
+
+    suffix = f"; launchers={','.join(installed_launchers)}" if installed_launchers else ""
+    print(f"DEPLOYED: fleet control -> {destination}{suffix}")
     return 0
 
 
