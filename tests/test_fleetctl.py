@@ -88,6 +88,7 @@ class FleetCtlTests(unittest.TestCase):
             "source_root": "/work/mcp-server",
             "bin_root": "/work/mcp-server/bin",
             "runtime_root": "/work/mcp-server/runtime",
+            "tunnel": {"tunnel_id": "tunnel_0123456789abcdef0123456789abcdef"},
             "servers": {
                 "filesystem": {},
                 "git": {"extra_args": ["--allow-remote-read"]},
@@ -99,9 +100,43 @@ class FleetCtlTests(unittest.TestCase):
         self.assertIn('/work/mcp-server/runtime/tunnel-client/current/tunnel-client-runtime-cloudflared', studio)
         self.assertNotIn('/target/release/', studio)
         tunnel = fleetctl.tunnel_config_text(host)
+        self.assertIn('tunnel_id: "tunnel_0123456789abcdef0123456789abcdef"', tunnel)
+        self.assertNotIn('tunnel_id: "aira"', tunnel)
         self.assertIn('/work/mcp-server/bin/rust-mcp-gateway', tunnel)
         self.assertIn('/work/mcp-server/runtime/gateway/servers.d', tunnel)
         self.assertNotIn('/mcp-server/src/', tunnel)
+
+    def test_tunnel_config_requires_explicit_valid_tunnel_id(self) -> None:
+        base = {
+            "host_id": "aira",
+            "bin_root": "/work/mcp-server/bin",
+            "runtime_root": "/work/mcp-server/runtime",
+        }
+
+        invalid_values = [
+            None,
+            "aira",
+            "tunnel_0123456789ABCDEF0123456789ABCDEF",
+            "tunnel_0123456789abcdef",
+        ]
+        for value in invalid_values:
+            host = dict(base)
+            if value is not None:
+                host["tunnel"] = {"tunnel_id": value}
+            with self.subTest(value=value):
+                with self.assertRaises(RuntimeError):
+                    fleetctl.tunnel_config_text(host)
+
+        valid = dict(base)
+        valid["tunnel"] = {
+            "tunnel_id": "tunnel_0123456789abcdef0123456789abcdef"
+        }
+        rendered = fleetctl.tunnel_config_text(valid)
+        self.assertIn(
+            'tunnel_id: "tunnel_0123456789abcdef0123456789abcdef"',
+            rendered,
+        )
+        self.assertNotIn('tunnel_id: "aira"', rendered)
 
     def test_render_plan_is_deterministic_pure_and_root_relative(self) -> None:
         host = {
@@ -110,6 +145,7 @@ class FleetCtlTests(unittest.TestCase):
             "source_root": "/work/mcp-server",
             "bin_root": "/work/mcp-server/bin",
             "runtime_root": "/work/mcp-server/runtime",
+            "tunnel": {"tunnel_id": "tunnel_0123456789abcdef0123456789abcdef"},
             "gateway": {"server_dir": "gateway/servers.d"},
             "servers": {
                 "filesystem": {},
@@ -159,6 +195,7 @@ class FleetCtlTests(unittest.TestCase):
             "source_root": "/work/mcp-server",
             "bin_root": "/work/mcp-server/bin",
             "runtime_root": "/work/mcp-server/runtime",
+            "tunnel": {"tunnel_id": "tunnel_0123456789abcdef0123456789abcdef"},
             "gateway": {"server_dir": "gateway/servers.d", "policy_file": "gateway/gateway.yaml"},
             "servers": {"filesystem": {}, "git": {}, "exec": {}},
         }
