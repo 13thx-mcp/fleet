@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: sonarqube-mcp <absolute-env-file>" >&2
+  exit 64
+fi
+
+env_file=$1
+case "$env_file" in
+  /*) ;;
+  *)
+    echo "sonarqube-mcp: env file must be an absolute path" >&2
+    exit 64
+    ;;
+esac
+
+if [ ! -f "$env_file" ]; then
+  echo "sonarqube-mcp: env file is unavailable" >&2
+  exit 66
+fi
+
+exec /usr/local/bin/docker run \
+  --init \
+  --rm \
+  -i \
+  --env-file "$env_file" \
+  -e SONARQUBE_READ_ONLY=true \
+  'sonarsource/sonarqube-mcp@sha256:21bb7bf785a8c9cbe19553f6957d83ef45138926bbb15ca9e1fc4895e5026b6f'

@@ -41,6 +41,20 @@ class FleetCtlTests(unittest.TestCase):
                 ["machine-specific host path", "tunnel identity outside test/example"],
             )
 
+    def test_source_hygiene_allows_generated_secrets_but_rejects_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            source = root / "bootstrap.py"
+            generated = "pass" + "word = secrets.token_urlsafe(36)\n"
+            source.write_text(generated)
+            self.assertEqual(source_hygiene.violations_for(source, root), [])
+            literal = "pass" + "word = \"" + "abcdefghijklmnop" + "\"\n"
+            source.write_text(literal)
+            self.assertEqual(
+                source_hygiene.violations_for(source, root),
+                ["probable credential assignment"],
+            )
+
     def test_runtime_host_profile_is_authority_without_source_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)
@@ -120,13 +134,15 @@ server_dir = "gateway/servers.d"
             root = Path(temp_name)
             fleet_root = root / "fleet"
             runtime_root = root / "runtime"
+            bin_root = root / "bin"
             runtime_host = runtime_root / "fleet/hosts/aira.toml"
             fleet_root.mkdir()
             runtime_host.parent.mkdir(parents=True)
+            (fleet_root / "VERSION").write_text("1.2.3\n")
             (fleet_root / "fleet.toml").write_text('fleet_name = "test"\n')
             (fleet_root / "README.md").write_text("test fleet\n")
             runtime_host.write_text(
-                f'host_id = "aira"\nruntime_root = "{runtime_root}"\n'
+                f'host_id = "aira"\nruntime_root = "{runtime_root}"\nbin_root = "{bin_root}"\n'
             )
             original_bytes = runtime_host.read_bytes()
 
@@ -210,6 +226,7 @@ server_dir = "gateway/servers.d"
 
     def test_generated_runtime_configs_use_bin_paths(self) -> None:
         host = {
+            "host_id": "test-host",
             "workspace_root": "/work",
             "source_root": "/work/mcp-server",
             "bin_root": "/work/mcp-server/bin",
@@ -294,6 +311,57 @@ server_dir = "gateway/servers.d"
             rendered,
         )
         self.assertNotIn('tunnel_id: "aira"', rendered)
+    def test_render_external_gateway_child_without_component(self) -> None:
+        host = {
+            "workspace_root": "/work",
+            "bin_root": "/work/bin",
+        }
+        fleet = {"components": {}}
+        rendered = fleetctl.render_server(
+            "sonarqube",
+            {
+                "enabled": False,
+                "command": "/work/bin/docker",
+                "args": ["run", "--rm", "-i", "sonarsource/sonarqube-mcp:1.27.0.4335"],
+                "timeout_ms": 60000,
+            },
+            host,
+            fleet,
+        )
+        self.assertIn('command: "/work/bin/docker"', rendered)
+        self.assertIn('enabled: false', rendered)
+        self.assertIn('sonarsource/sonarqube-mcp:1.27.0.4335', rendered)
+        self.assertNotIn('--root', rendered)
+
+    def test_render_trusted_launcher_under_bin_root(self) -> None:
+        host = {
+            "workspace_root": "/work",
+            "bin_root": "/work/bin",
+        }
+        rendered = fleetctl.render_server(
+            "sonarqube",
+            {
+                "enabled": True,
+                "launcher": "sonarqube-mcp",
+                "args": ["/run/secrets/sonarqube-mcp.env"],
+                "timeout_ms": 60000,
+            },
+            host,
+            {"components": {}},
+        )
+        self.assertIn('command: "/work/bin/sonarqube-mcp"', rendered)
+        self.assertIn('  - "/run/secrets/sonarqube-mcp.env"', rendered)
+        self.assertNotIn('/usr/local/bin/docker', rendered)
+        self.assertNotIn('sonarsource/sonarqube-mcp', rendered)
+
+    def test_sonarqube_launcher_pins_read_only_image_digest(self) -> None:
+        launcher = (fleetctl.LAUNCHERS_DIR / "sonarqube-mcp").read_text()
+        self.assertIn("SONARQUBE_READ_ONLY=true", launcher)
+        self.assertIn(
+            "sonarsource/sonarqube-mcp@sha256:21bb7bf785a8c9cbe19553f6957d83ef45138926bbb15ca9e1fc4895e5026b6f",
+            launcher,
+        )
+        self.assertNotIn(":1.27.0.4335", launcher)
 
     def test_render_plan_is_deterministic_pure_and_root_relative(self) -> None:
         host = {
@@ -375,6 +443,42 @@ server_dir = "gateway/servers.d"
         with self.assertRaises(RuntimeError):
             fleetctl.gateway_policy_text(host)
 
+    def test_deploy_control_installs_complete_runtime_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            source = root / "source"
+            runtime = root / "runtime"
+            bin_root = root / "bin"
+            (source / "launchers").mkdir(parents=True)
+            (runtime / "fleet/hosts").mkdir(parents=True)
+            (source / "VERSION").write_text("1.2.3\n")
+            (source / "fleet.toml").write_text("schema_version = 2\n")
+            (source / "README.md").write_text("fleet\n")
+            (source / "launchers/test-launcher").write_text("#!/bin/sh\n")
+            (runtime / "fleet/hosts/test.toml").write_text(
+                f'host_id = "test"\nruntime_root = "{runtime}"\n'
+                f'bin_root = "{bin_root}"\n[servers.test]\n'
+                'launcher = "test-launcher"\n'
+            )
+
+            with (
+                mock.patch.object(fleetctl, "FLEET_DIR", source),
+                mock.patch.object(fleetctl, "FLEET_CONFIG", source / "fleet.toml"),
+                mock.patch.object(fleetctl, "LAUNCHERS_DIR", source / "launchers"),
+            ):
+                self.assertEqual(fleetctl.deploy_control("test"), 0)
+
+            installed = runtime / "fleet"
+            self.assertEqual((installed / "VERSION").read_text(), "1.2.3\n")
+            self.assertEqual(
+                (installed / "launchers/test-launcher").read_text(),
+                "#!/bin/sh\n",
+            )
+            self.assertTrue(
+                (installed / "launchers/test-launcher").stat().st_mode & 0o111
+            )
+            self.assertEqual((bin_root / "test-launcher").read_text(), "#!/bin/sh\n")
+
     def test_self_update_tree_fingerprint_is_deterministic_and_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)
@@ -408,6 +512,138 @@ server_dir = "gateway/servers.d"
         with self.assertRaises(RuntimeError):
             fleetctl.validate_self_update_metadata(metadata, "txn-studio-good", 124)
 
+    def test_studio_contract_requires_process_bound_protocol_v2(self) -> None:
+        contract = fleetctl.studio_contract()
+        self.assertEqual(contract["activation_protocol"], 2)
+        self.assertIn(2, contract["schema_versions"])
+        self.assertTrue(contract["process_bound_readiness"])
+        self.assertTrue(contract["cross_process_lock"])
+
+    def test_self_update_revision_rejects_stale_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            path = Path(temp_name) / "state.json"
+            current = {
+                "journal_revision": 1,
+                "phase": "external_activating",
+            }
+            fleetctl.write_json_atomic(path, current)
+            stale = dict(current)
+            stale["journal_revision"] = 0
+            with self.assertRaises(RuntimeError):
+                fleetctl.update_self_update_metadata(
+                    path, stale, "external_activated"
+                )
+            self.assertEqual(
+                fleetctl.read_regular_json(path)["phase"],
+                "external_activating",
+            )
+
+    def test_activation_lock_rejects_concurrent_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            studio_root = Path(temp_name) / "studio"
+            with fleetctl.studio_activation_lock(studio_root):
+                with self.assertRaises(RuntimeError):
+                    with fleetctl.studio_activation_lock(studio_root):
+                        pass
+
+    def test_readiness_rejects_unrelated_health_when_spawned_process_exited(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            release = root / "release"
+            (release / "web/dist").mkdir(parents=True)
+            (release / "mcp-studio").write_bytes(b"binary")
+            (release / "web/dist/index.html").write_text("web")
+            fingerprint = fleetctl.self_update_tree_fingerprint(release)
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            proc.pid = 5401
+            with (
+                mock.patch.object(fleetctl, "studio_health", return_value=True),
+                mock.patch.object(fleetctl, "SELF_UPDATE_HEALTH_TIMEOUT_SECONDS", 0.01),
+                mock.patch.object(fleetctl, "SELF_UPDATE_POLL_SECONDS", 0.001),
+            ):
+                self.assertFalse(
+                    fleetctl.wait_for_spawned_studio_readiness(
+                        root,
+                        "0.5.0",
+                        proc,
+                        release,
+                        fingerprint,
+                        "release_tree",
+                        "txn-studio-unrelated",
+                        "a" * 64,
+                    )
+                )
+
+    def test_readiness_requires_matching_spawned_process_nonce_and_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            studio_root = root / "studio"
+            release = root / "release"
+            (release / "web/dist").mkdir(parents=True)
+            (release / "mcp-studio").write_bytes(b"binary")
+            (release / "web/dist/index.html").write_text("web")
+            (studio_root / "data/self-update").mkdir(parents=True)
+            config = studio_root / "studio.toml"
+            config.write_text('[server]\nlisten_addr = "127.0.0.1:18100"\n')
+            fingerprint = fleetctl.self_update_tree_fingerprint(release)
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            proc.pid = 5501
+            tx = "txn-studio-proof"
+            nonce = "b" * 64
+            fleetctl.write_json_atomic(
+                fleetctl.activation_proof_path(studio_root, tx),
+                {
+                    "schema_version": 1,
+                    "transaction_id": tx,
+                    "nonce": nonce,
+                    "pid": proc.pid,
+                    "config_path": str(config.resolve()),
+                    "config_sha256": fleetctl.file_sha256(config),
+                },
+            )
+            with (
+                mock.patch.object(fleetctl, "studio_health", return_value=True),
+                mock.patch.object(fleetctl, "SELF_UPDATE_READY_STABILITY_SECONDS", 0.0),
+            ):
+                self.assertTrue(
+                    fleetctl.wait_for_spawned_studio_readiness(
+                        studio_root,
+                        "0.5.0",
+                        proc,
+                        release,
+                        fingerprint,
+                        "release_tree",
+                        tx,
+                        nonce,
+                    )
+                )
+            wrong_pid = fleetctl.read_regular_json(
+                fleetctl.activation_proof_path(studio_root, tx)
+            )
+            wrong_pid["pid"] = 9999
+            fleetctl.write_json_atomic(
+                fleetctl.activation_proof_path(studio_root, tx), wrong_pid
+            )
+            with (
+                mock.patch.object(fleetctl, "studio_health", return_value=True),
+                mock.patch.object(fleetctl, "SELF_UPDATE_HEALTH_TIMEOUT_SECONDS", 0.01),
+                mock.patch.object(fleetctl, "SELF_UPDATE_POLL_SECONDS", 0.001),
+            ):
+                self.assertFalse(
+                    fleetctl.wait_for_spawned_studio_readiness(
+                        studio_root,
+                        "0.5.0",
+                        proc,
+                        release,
+                        fingerprint,
+                        "release_tree",
+                        tx,
+                        nonce,
+                    )
+                )
+
     def _self_update_fixture(self, root: Path) -> tuple[Path, str]:
         fleet_root = root / "fleet"
         runtime_root = root / "runtime"
@@ -431,7 +667,9 @@ server_dir = "gateway/servers.d"
         (candidate / "web/dist/index.html").write_text("new web")
         fingerprint = fleetctl.self_update_tree_fingerprint(candidate)
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "launcher_protocol": 2,
+            "journal_revision": 0,
             "transaction_id": tx,
             "component": "studio",
             "source_version": "0.4.0",
@@ -464,11 +702,12 @@ server_dir = "gateway/servers.d"
 
                 fake_process = mock.Mock()
                 fake_process.poll.return_value = None
+                fake_process.pid = 5001
                 with (
                     mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
                     mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
                     mock.patch.object(fleetctl, "spawn_studio", return_value=fake_process),
-                    mock.patch.object(fleetctl, "wait_for_studio_health", return_value=True),
+                    mock.patch.object(fleetctl, "wait_for_spawned_studio_readiness", return_value=True),
                 ):
                     self.assertEqual(fleetctl.studio_activate("test", tx, 999), 0)
                 studio_root = root / "runtime/studio"
@@ -498,15 +737,16 @@ server_dir = "gateway/servers.d"
                     return "0.5.0" if "releases" in path.parts else "0.4.0"
 
                 processes = [mock.Mock(), mock.Mock()]
-                for proc in processes:
+                for index, proc in enumerate(processes, start=1):
                     proc.poll.return_value = None
+                    proc.pid = 5100 + index
                 with (
                     mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
                     mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
                     mock.patch.object(fleetctl, "spawn_studio", side_effect=processes),
                     mock.patch.object(
                         fleetctl,
-                        "wait_for_studio_health",
+                        "wait_for_spawned_studio_readiness",
                         side_effect=[False, True],
                     ),
                     mock.patch.object(fleetctl, "stop_spawned_process"),
@@ -537,6 +777,7 @@ server_dir = "gateway/servers.d"
 
                 rollback_proc = mock.Mock()
                 rollback_proc.poll.return_value = None
+                rollback_proc.pid = 5201
                 with (
                     mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
                     mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
@@ -545,7 +786,7 @@ server_dir = "gateway/servers.d"
                         "spawn_studio",
                         side_effect=[OSError("forced spawn failure"), rollback_proc],
                     ),
-                    mock.patch.object(fleetctl, "wait_for_studio_health", return_value=True),
+                    mock.patch.object(fleetctl, "wait_for_spawned_studio_readiness", return_value=True),
                 ):
                     self.assertEqual(fleetctl.studio_activate("test", tx, 999), 3)
                 studio_root = root / "runtime/studio"
@@ -587,12 +828,13 @@ server_dir = "gateway/servers.d"
 
                 proc = mock.Mock()
                 proc.poll.return_value = None
+                proc.pid = 5301
                 with (
                     mock.patch.object(fleetctl, "studio_health", return_value=False),
                     mock.patch.object(fleetctl, "wait_for_pid_exit", return_value=True),
                     mock.patch.object(fleetctl, "binary_version", side_effect=fake_version),
                     mock.patch.object(fleetctl, "spawn_studio", return_value=proc),
-                    mock.patch.object(fleetctl, "wait_for_studio_health", return_value=True),
+                    mock.patch.object(fleetctl, "wait_for_spawned_studio_readiness", return_value=True),
                 ):
                     self.assertEqual(fleetctl.studio_activate("test", tx, 999), 0)
                 state = fleetctl.read_regular_json(metadata_path)
