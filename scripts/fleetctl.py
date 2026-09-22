@@ -660,6 +660,19 @@ def studio_config_text(host: dict[str, Any]) -> str:
     bin_root = Path(host["bin_root"]).resolve()
     runtime_root = Path(host["runtime_root"]).resolve()
     workspace_root = host["workspace_root"]
+    source_root = Path(host["source_root"]).resolve()
+    tunnel = host.get("tunnel", {})
+    api_key_file = (
+        tunnel.get("control_plane_api_key_file")
+        if isinstance(tunnel, dict)
+        else None
+    )
+    if api_key_file is not None:
+        if not isinstance(api_key_file, str) or not api_key_file.strip():
+            raise RuntimeError("invalid tunnel.control_plane_api_key_file")
+        if not Path(api_key_file).is_absolute():
+            raise RuntimeError("tunnel.control_plane_api_key_file must be absolute")
+
     lines = [
         "log_capacity = 500",
         "stop_timeout_ms = 3000",
@@ -671,6 +684,11 @@ def studio_config_text(host: dict[str, Any]) -> str:
         f"path = {toml_string(str(runtime_root / 'studio' / 'data' / 'registry.toml'))}",
         f"mcp_root = {toml_string(str(bin_root))}",
         "",
+        "[updates]",
+        f"source_root = {toml_string(str(source_root))}",
+        f"bin_root = {toml_string(str(bin_root))}",
+        f"runtime_root = {toml_string(str(runtime_root))}",
+        "",
         "[tunnel]",
         "name = \"Secure tunnel\"",
         f"runtime = {toml_string(str(runtime_root / 'tunnel-client' / 'current' / 'tunnel-client-runtime-cloudflared'))}",
@@ -678,6 +696,12 @@ def studio_config_text(host: dict[str, Any]) -> str:
         f"config_file = {toml_string(str(runtime_root / 'tunnel-client' / 'config.yaml'))}",
         "",
     ]
+    if api_key_file is not None:
+        lines.extend([
+            "[tunnel.env]",
+            f"CONTROL_PLANE_API_KEY = {{ from_file = {toml_string(api_key_file)} }}",
+            "",
+        ])
     binary_names = {"filesystem": "rust-mcp-filesystem", "git": "rust-mcp-git", "exec": "rust-mcp-exec"}
     display_names = {"filesystem": "Filesystem", "git": "Git", "exec": "Exec"}
     for name in ("filesystem", "git", "exec"):

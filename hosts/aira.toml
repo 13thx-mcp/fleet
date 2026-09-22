@@ -7,6 +7,7 @@ runtime_root = "/Users/xiivth/workspaces/signs/mcp-server/runtime"
 
 [tunnel]
 tunnel_id = "tunnel_6aaa078723508191a0a0e9a43f68e84e"
+control_plane_api_key_file = "/Users/xiivth/workspaces/signs/mcp-server/runtime/tunnel-client/credentials/control-plane-api-key"
 
 [gateway]
 server_dir = "gateway/servers.d"
