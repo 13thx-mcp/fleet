@@ -31,6 +31,24 @@ class FleetCtlTests(unittest.TestCase):
         self.assertEqual(fleetctl.parse_semver("v1.2.3"), (1, 2, 3))
         self.assertIsNone(fleetctl.parse_semver("unknown"))
 
+    def test_tunnel_binary_identity_requires_matching_official_forms(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            binary = Path(temp_name) / "tunnel-client"
+            binary.write_bytes(b"binary")
+            with mock.patch.object(fleetctl, "run", return_value=(0, "0.0.14 git sha: 0f870e50 flavor=runtime", "")):
+                self.assertEqual(
+                    fleetctl.tunnel_binary_identity(binary, "runtime"),
+                    ("0.0.14", "0f870e50"),
+                )
+            with mock.patch.object(fleetctl, "run", return_value=(0, "0.0.14+0f870e50", "")):
+                self.assertEqual(
+                    fleetctl.tunnel_binary_identity(binary, "full"),
+                    ("0.0.14", "0f870e50"),
+                )
+            with mock.patch.object(fleetctl, "run", return_value=(0, "0.0.14", "")):
+                with self.assertRaises(RuntimeError):
+                    fleetctl.tunnel_binary_identity(binary, "full")
+
     def test_expected_checksum(self) -> None:
         text = "abc123  first.zip\ndef456 *second.zip\n"
         self.assertEqual(fleetctl.expected_checksum(text, "first.zip"), "abc123")

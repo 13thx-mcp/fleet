@@ -102,6 +102,21 @@ def binary_version(binary: Path) -> str | None:
     return ".".join(str(part) for part in parsed) if parsed else None
 
 
+def tunnel_binary_identity(binary: Path, role: str) -> tuple[str, str]:
+    if not binary.is_file():
+        raise RuntimeError(f"missing staged {role} tunnel binary")
+    code, out, _ = run([str(binary), "--version"], binary.parent)
+    if code != 0:
+        raise RuntimeError(f"cannot query staged {role} tunnel binary version")
+    if role == "runtime":
+        match = re.search(r"^(\d+\.\d+\.\d+) git sha: ([0-9a-f]{7,64})\b", out)
+    else:
+        match = re.search(r"^(\d+\.\d+\.\d+)\+([0-9a-f]{7,64})\b", out)
+    if not match:
+        raise RuntimeError(f"staged {role} tunnel binary identity is invalid")
+    return match.group(1), match.group(2)
+
+
 def bundle_info(path: Path, component: dict[str, Any]) -> dict[str, Any]:
     current = path / "current"
     binary = (current / component["binary"]) if current.exists() else (path / component["binary"])
@@ -193,9 +208,11 @@ def tunnel_release_state(host_name: str) -> dict[str, Any]:
     latest_version = tag.removeprefix("v")
     target_os, target_arch = host_platform()
     asset_name = f"{component['asset_prefix']}-v{latest_version}-{target_os}-{target_arch}.zip"
+    full_asset_name = f"tunnel-client-v{latest_version}-{target_os}-{target_arch}.zip"
     assets = release_assets(release)
-    if asset_name not in assets:
-        raise RuntimeError(f"official release {tag} has no asset {asset_name}")
+    for name in (asset_name, full_asset_name):
+        if name not in assets:
+            raise RuntimeError(f"official release {tag} has no asset {name}")
     if "SHA256SUMS.txt" not in assets:
         raise RuntimeError(f"official release {tag} has no SHA256SUMS.txt")
     current_version = info.get("version")
@@ -211,6 +228,8 @@ def tunnel_release_state(host_name: str) -> dict[str, Any]:
         "latest_tag": tag,
         "asset_name": asset_name,
         "asset_url": assets[asset_name],
+        "full_asset_name": full_asset_name,
+        "full_asset_url": assets[full_asset_name],
         "checksums_url": assets["SHA256SUMS.txt"],
         "up_to_date": current_semver is not None and latest_semver == current_semver,
         "update_available": current_semver is None or (latest_semver is not None and latest_semver > current_semver),
@@ -220,7 +239,7 @@ def tunnel_release_state(host_name: str) -> dict[str, Any]:
 def tunnel_check(host_name: str) -> int:
     state = tunnel_release_state(host_name)
     print(f"host={host_name} os={state['os']} arch={state['arch']}")
-    print(f"installed={state['current_version'] or '-'} latest={state['latest_version']} asset={state['asset_name']}")
+    print(f"installed={state['current_version'] or '-'} latest={state['latest_version']} runtime={state['asset_name']} full={state['full_asset_name']}")
     print("status=up-to-date" if state["up_to_date"] else "status=update-available")
     return 0
 
@@ -252,31 +271,44 @@ def tunnel_update(host_name: str, force: bool) -> int:
     with tempfile.TemporaryDirectory(prefix="tunnel-client-update-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         archive = temp_dir / state["asset_name"]
+        full_archive = temp_dir / state["full_asset_name"]
         archive.write_bytes(http_bytes(state["asset_url"]))
+        full_archive.write_bytes(http_bytes(state["full_asset_url"]))
         checksum_text = http_bytes(state["checksums_url"]).decode("utf-8")
-        expected = expected_checksum(checksum_text, state["asset_name"])
-        actual = sha256_file(archive)
-        if actual != expected:
-            raise RuntimeError(f"checksum mismatch for {state['asset_name']}: expected {expected}, got {actual}")
+        for name, candidate in ((state["asset_name"], archive), (state["full_asset_name"], full_archive)):
+            expected = expected_checksum(checksum_text, name)
+            actual = sha256_file(candidate)
+            if actual != expected:
+                raise RuntimeError(f"checksum mismatch for {name}: expected {expected}, got {actual}")
 
         extracted = temp_dir / "extracted"
+        full_extracted = temp_dir / "full-extracted"
         extracted.mkdir()
+        full_extracted.mkdir()
         safe_extract_zip(archive, extracted)
+        safe_extract_zip(full_archive, full_extracted)
         staged_binary = extracted / state["component"]["binary"]
+        staged_full_binary = full_extracted / "tunnel-client"
         for executable_name in (state["component"]["binary"], "cloudflared"):
             executable = extracted / executable_name
             if executable.is_file():
                 executable.chmod(executable.stat().st_mode | 0o111)
-        staged_version = binary_version(staged_binary)
-        if staged_version != state["latest_version"]:
+        staged_full_binary.chmod(staged_full_binary.stat().st_mode | 0o111)
+        runtime_version, runtime_commit = tunnel_binary_identity(staged_binary, "runtime")
+        full_version, full_commit = tunnel_binary_identity(staged_full_binary, "full")
+        if runtime_version != state["latest_version"] or full_version != state["latest_version"]:
             raise RuntimeError(
-                f"release binary version mismatch: expected {state['latest_version']}, got {staged_version or 'unknown'}"
+                f"release binary version mismatch: expected {state['latest_version']}, got runtime={runtime_version} full={full_version}"
             )
+        if runtime_commit != full_commit:
+            raise RuntimeError("full and runtime tunnel artifacts have different release commits")
 
         staged_dir = releases_dir / f".v{state['latest_version']}.{os.getpid()}.tmp"
         if staged_dir.exists():
             shutil.rmtree(staged_dir)
         shutil.copytree(extracted, staged_dir)
+        shutil.copy2(staged_full_binary, staged_dir / "tunnel-client")
+        (staged_dir / "tunnel-client").chmod(staged_full_binary.stat().st_mode)
         for executable_name in (state["component"]["binary"], "cloudflared"):
             executable = staged_dir / executable_name
             if executable.is_file():

@@ -61,9 +61,9 @@ Do not commit:
 
 - repository: `https://github.com/openai/tunnel-client`
 - release API: `https://api.github.com/repos/openai/tunnel-client/releases/latest`
-- selected artifact: `tunnel-client-runtime-cloudflared-v<version>-<os>-<arch>.zip`
+- selected release pair: `tunnel-client-runtime-cloudflared-v<version>-<os>-<arch>.zip` and `tunnel-client-v<version>-<os>-<arch>.zip`
 
-`tunnel-check` detects the local OS/architecture and compares the installed binary's `--version` against the latest official release. `tunnel-update` downloads the matching official asset plus `SHA256SUMS.txt`, verifies SHA-256, validates the extracted binary version, installs it under `bin/tunnel-client/releases/v<version>`, and atomically repoints `bin/tunnel-client/current`. The host-local `config.yaml` is outside the release directory and is never overwritten.
+`tunnel-check` detects the local OS/architecture and compares the installed runtime against the latest official release. `tunnel-update` downloads both matched official artifacts plus `SHA256SUMS.txt`, verifies each SHA-256, validates runtime/full version and shared release commit, installs both executables under `runtime/tunnel-client/releases/v<version>`, and atomically repoints `runtime/tunnel-client/current`. The host-local `config.yaml` is outside the release directory and is never overwritten.
 
 The installed layout is:
 
