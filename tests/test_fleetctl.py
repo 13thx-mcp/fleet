@@ -88,7 +88,10 @@ class FleetCtlTests(unittest.TestCase):
             "source_root": "/work/mcp-server",
             "bin_root": "/work/mcp-server/bin",
             "runtime_root": "/work/mcp-server/runtime",
-            "tunnel": {"tunnel_id": "tunnel_0123456789abcdef0123456789abcdef"},
+            "tunnel": {
+                "tunnel_id": "tunnel_0123456789abcdef0123456789abcdef",
+                "control_plane_api_key_file": "/run/secrets/control-plane-api-key",
+            },
             "servers": {
                 "filesystem": {},
                 "git": {"extra_args": ["--allow-remote-read"]},
@@ -98,6 +101,15 @@ class FleetCtlTests(unittest.TestCase):
         studio = fleetctl.studio_config_text(host)
         self.assertIn('/work/mcp-server/bin/rust-mcp-filesystem', studio)
         self.assertIn('/work/mcp-server/runtime/tunnel-client/current/tunnel-client-runtime-cloudflared', studio)
+        self.assertIn('[updates]', studio)
+        self.assertIn('source_root = "/work/mcp-server"', studio)
+        self.assertIn('bin_root = "/work/mcp-server/bin"', studio)
+        self.assertIn('runtime_root = "/work/mcp-server/runtime"', studio)
+        self.assertIn('[tunnel.env]', studio)
+        self.assertIn(
+            'CONTROL_PLANE_API_KEY = { from_file = "/run/secrets/control-plane-api-key" }',
+            studio,
+        )
         self.assertNotIn('/target/release/', studio)
         tunnel = fleetctl.tunnel_config_text(host)
         self.assertIn('tunnel_id: "tunnel_0123456789abcdef0123456789abcdef"', tunnel)
@@ -105,6 +117,25 @@ class FleetCtlTests(unittest.TestCase):
         self.assertIn('/work/mcp-server/bin/rust-mcp-gateway', tunnel)
         self.assertIn('/work/mcp-server/runtime/gateway/servers.d', tunnel)
         self.assertNotIn('/mcp-server/src/', tunnel)
+
+    def test_studio_config_requires_absolute_secret_file_reference(self) -> None:
+        host = {
+            "workspace_root": "/work",
+            "source_root": "/work/mcp-server",
+            "bin_root": "/work/mcp-server/bin",
+            "runtime_root": "/work/mcp-server/runtime",
+            "tunnel": {
+                "tunnel_id": "tunnel_0123456789abcdef0123456789abcdef",
+                "control_plane_api_key_file": "relative/api-key",
+            },
+            "servers": {
+                "filesystem": {},
+                "git": {},
+                "exec": {},
+            },
+        }
+        with self.assertRaises(RuntimeError):
+            fleetctl.studio_config_text(host)
 
     def test_tunnel_config_requires_explicit_valid_tunnel_id(self) -> None:
         base = {
