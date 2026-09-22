@@ -181,6 +181,17 @@ def release_assets(release: dict[str, Any]) -> dict[str, str]:
     return {asset["name"]: asset["browser_download_url"] for asset in release.get("assets", [])}
 
 
+def select_tunnel_release_assets(
+    assets: dict[str, str], version: str, target_os: str, target_arch: str, runtime_prefix: str
+) -> tuple[str, str]:
+    runtime_name = f"{runtime_prefix}-v{version}-{target_os}-{target_arch}.zip"
+    full_name = f"tunnel-client-v{version}-{target_os}-{target_arch}.zip"
+    for name in (runtime_name, full_name):
+        if name not in assets:
+            raise RuntimeError(f"official release has no asset {name}")
+    return runtime_name, full_name
+
+
 def expected_checksum(checksums: str, filename: str) -> str:
     for line in checksums.splitlines():
         parts = line.strip().split()
@@ -207,12 +218,10 @@ def tunnel_release_state(host_name: str) -> dict[str, Any]:
     tag = release["tag_name"]
     latest_version = tag.removeprefix("v")
     target_os, target_arch = host_platform()
-    asset_name = f"{component['asset_prefix']}-v{latest_version}-{target_os}-{target_arch}.zip"
-    full_asset_name = f"tunnel-client-v{latest_version}-{target_os}-{target_arch}.zip"
     assets = release_assets(release)
-    for name in (asset_name, full_asset_name):
-        if name not in assets:
-            raise RuntimeError(f"official release {tag} has no asset {name}")
+    asset_name, full_asset_name = select_tunnel_release_assets(
+        assets, latest_version, target_os, target_arch, component["asset_prefix"]
+    )
     if "SHA256SUMS.txt" not in assets:
         raise RuntimeError(f"official release {tag} has no SHA256SUMS.txt")
     current_version = info.get("version")

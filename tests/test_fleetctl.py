@@ -56,6 +56,21 @@ class FleetCtlTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             fleetctl.expected_checksum(text, "missing.zip")
 
+    def test_tunnel_release_selection_requires_full_and_runtime_assets(self) -> None:
+        runtime = "tunnel-client-runtime-cloudflared-v0.0.14-darwin-arm64.zip"
+        full = "tunnel-client-v0.0.14-darwin-arm64.zip"
+        assets = {runtime: "runtime-url", full: "full-url"}
+        self.assertEqual(
+            fleetctl.select_tunnel_release_assets(
+                assets, "0.0.14", "darwin", "arm64", "tunnel-client-runtime-cloudflared"
+            ),
+            (runtime, full),
+        )
+        with self.assertRaises(RuntimeError):
+            fleetctl.select_tunnel_release_assets(
+                {runtime: "runtime-url"}, "0.0.14", "darwin", "arm64", "tunnel-client-runtime-cloudflared"
+            )
+
     def test_safe_extract_rejects_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)
