@@ -404,6 +404,67 @@ def yaml_string(value: str) -> str:
     return json.dumps(value)
 
 
+def gateway_policy_text(host: dict[str, Any]) -> str | None:
+    if int(host.get("schema_version", 1)) < 2:
+        return None
+    policy = host.get("gateway", {}).get("policy", {})
+    profiles = policy.get("profiles", ["inspect", "develop", "release", "ops", "hardware"])
+    if not isinstance(profiles, list) or not profiles or any(not isinstance(name, str) or not name for name in profiles):
+        raise RuntimeError("gateway.policy.profiles must be a non-empty string list")
+    active_profile = policy.get("active_profile", "develop")
+    if active_profile not in profiles:
+        raise RuntimeError("gateway.policy.active_profile must be declared")
+    limits = {
+        "global_active": int(policy.get("global_active", 16)),
+        "global_queue": int(policy.get("global_queue", 64)),
+        "queue_wait_ms": int(policy.get("queue_wait_ms", 30000)),
+        "default_child_active": int(policy.get("default_child_active", 4)),
+    }
+    if any(value <= 0 for value in limits.values()):
+        raise RuntimeError("gateway.policy limits must be positive")
+    drain_deadline_ms = int(policy.get("drain_deadline_ms", 60000))
+    if drain_deadline_ms <= 0:
+        raise RuntimeError("gateway.policy.drain_deadline_ms must be positive")
+    lines = [
+        "schema_version: 1",
+        f"active_profile: {yaml_string(active_profile)}",
+        "limits:",
+        *(f"  {key}: {value}" for key, value in limits.items()),
+        "tool_class_defaults:",
+        "  read: {concurrency: 4}",
+        "  mutation: {concurrency: 1}",
+        "  long-running: {concurrency: 1}",
+        "  control: {concurrency: 1}",
+        "drain:",
+        f"  deadline_ms: {drain_deadline_ms}",
+        f"  allow_safe_reads: {'true' if policy.get('allow_safe_reads', False) else 'false'}",
+        "payload:",
+        "  request_bytes: 1048576",
+        "  response_bytes: 2097152",
+        "  text_preview_bytes: 65536",
+        "  structured_bytes: 1048576",
+        "  binary_bytes: 1048576",
+        "artifacts:",
+        "  enabled: true",
+        "  ttl_seconds: 900",
+        "  max_item_bytes: 8388608",
+        "  max_total_bytes: 67108864",
+        "profiles:",
+        *(f"  {name}: {{}}" for name in sorted(profiles)),
+        "children: {}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def gateway_policy_path(host: dict[str, Any]) -> Path:
+    runtime_root = Path(host["runtime_root"]).resolve()
+    relative = Path(host.get("gateway", {}).get("policy_file", "gateway/gateway.yaml"))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError("gateway.policy_file must be runtime-root relative")
+    return (runtime_root / relative).resolve()
+
+
 def render_server(name: str, server: dict[str, Any], host: dict[str, Any], fleet: dict[str, Any]) -> str:
     component = fleet["components"][name]
     command = Path(host["bin_root"]) / component["binary"]
@@ -441,6 +502,9 @@ def gateway_outputs(host_name: str) -> dict[Path, str]:
     outputs: dict[Path, str] = {}
     for name in ("filesystem", "git", "exec"):
         outputs[server_dir / f"{name}.yaml"] = render_server(name, host["servers"][name], host, fleet)
+    policy = gateway_policy_text(host)
+    if policy is not None:
+        outputs[gateway_policy_path(host)] = policy
     return outputs
 
 
@@ -473,6 +537,10 @@ def render_plan_data(host: dict[str, Any], fleet: dict[str, Any]) -> dict[str, A
             render_server(name, host["servers"][name], host, fleet),
             ["gateway_reload"],
         )
+
+    policy = gateway_policy_text(host)
+    if policy is not None:
+        add("gateway.policy", gateway_policy_path(host), policy, ["gateway_reload"])
 
     add(
         "studio.config",

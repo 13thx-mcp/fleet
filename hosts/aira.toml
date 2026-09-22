@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 host_id = "aira"
 workspace_root = "/Users/xiivth/workspaces/signs"
 source_root = "/Users/xiivth/workspaces/signs/mcp-server"
@@ -7,6 +7,17 @@ runtime_root = "/Users/xiivth/workspaces/signs/mcp-server/runtime"
 
 [gateway]
 server_dir = "gateway/servers.d"
+policy_file = "gateway/gateway.yaml"
+
+[gateway.policy]
+active_profile = "develop"
+global_active = 16
+global_queue = 64
+queue_wait_ms = 30000
+default_child_active = 4
+drain_deadline_ms = 60000
+allow_safe_reads = false
+profiles = ["inspect", "develop", "release", "ops", "hardware"]
 
 [servers.filesystem]
 enabled = true

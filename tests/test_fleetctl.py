@@ -118,6 +118,36 @@ class FleetCtlTests(unittest.TestCase):
             self.assertEqual(item["ownership"], "fleet_managed")
             self.assertNotIn("target/release", payload.decode())
 
+    def test_schema_v2_renders_gateway_policy_surface(self) -> None:
+        host = {
+            "schema_version": 2,
+            "host_id": "test-host",
+            "workspace_root": "/work",
+            "source_root": "/work/mcp-server",
+            "bin_root": "/work/mcp-server/bin",
+            "runtime_root": "/work/mcp-server/runtime",
+            "gateway": {"server_dir": "gateway/servers.d", "policy_file": "gateway/gateway.yaml"},
+            "servers": {"filesystem": {}, "git": {}, "exec": {}},
+        }
+        fleet = {"components": {
+            "filesystem": {"binary": "rust-mcp-filesystem"},
+            "git": {"binary": "rust-mcp-git"},
+            "exec": {"binary": "rust-mcp-exec"},
+        }}
+        plan = fleetctl.render_plan_data(host, fleet)
+        policy = next(item for item in plan["outputs"] if item["surface"] == "gateway.policy")
+        self.assertEqual(policy["relative_path"], "gateway/gateway.yaml")
+        self.assertIn("schema_version: 1", base64.b64decode(policy["content_b64"]).decode())
+
+    def test_schema_v2_policy_rejects_unknown_active_profile(self) -> None:
+        host = {
+            "schema_version": 2,
+            "runtime_root": "/work/runtime",
+            "gateway": {"policy": {"active_profile": "missing", "profiles": ["develop"]}},
+        }
+        with self.assertRaises(RuntimeError):
+            fleetctl.gateway_policy_text(host)
+
     def test_self_update_tree_fingerprint_is_deterministic_and_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)
