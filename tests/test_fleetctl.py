@@ -31,12 +31,45 @@ class FleetCtlTests(unittest.TestCase):
         self.assertEqual(fleetctl.parse_semver("v1.2.3"), (1, 2, 3))
         self.assertIsNone(fleetctl.parse_semver("unknown"))
 
+    def test_tunnel_binary_identity_requires_matching_official_forms(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            binary = Path(temp_name) / "tunnel-client"
+            binary.write_bytes(b"binary")
+            with mock.patch.object(fleetctl, "run", return_value=(0, "0.0.14 git sha: 0f870e50 flavor=runtime", "")):
+                self.assertEqual(
+                    fleetctl.tunnel_binary_identity(binary, "runtime"),
+                    ("0.0.14", "0f870e50"),
+                )
+            with mock.patch.object(fleetctl, "run", return_value=(0, "0.0.14+0f870e50", "")):
+                self.assertEqual(
+                    fleetctl.tunnel_binary_identity(binary, "full"),
+                    ("0.0.14", "0f870e50"),
+                )
+            with mock.patch.object(fleetctl, "run", return_value=(0, "0.0.14", "")):
+                with self.assertRaises(RuntimeError):
+                    fleetctl.tunnel_binary_identity(binary, "full")
+
     def test_expected_checksum(self) -> None:
         text = "abc123  first.zip\ndef456 *second.zip\n"
         self.assertEqual(fleetctl.expected_checksum(text, "first.zip"), "abc123")
         self.assertEqual(fleetctl.expected_checksum(text, "second.zip"), "def456")
         with self.assertRaises(RuntimeError):
             fleetctl.expected_checksum(text, "missing.zip")
+
+    def test_tunnel_release_selection_requires_full_and_runtime_assets(self) -> None:
+        runtime = "tunnel-client-runtime-cloudflared-v0.0.14-darwin-arm64.zip"
+        full = "tunnel-client-v0.0.14-darwin-arm64.zip"
+        assets = {runtime: "runtime-url", full: "full-url"}
+        self.assertEqual(
+            fleetctl.select_tunnel_release_assets(
+                assets, "0.0.14", "darwin", "arm64", "tunnel-client-runtime-cloudflared"
+            ),
+            (runtime, full),
+        )
+        with self.assertRaises(RuntimeError):
+            fleetctl.select_tunnel_release_assets(
+                {runtime: "runtime-url"}, "0.0.14", "darwin", "arm64", "tunnel-client-runtime-cloudflared"
+            )
 
     def test_safe_extract_rejects_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
@@ -117,6 +150,36 @@ class FleetCtlTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(payload).hexdigest(), item["sha256"])
             self.assertEqual(item["ownership"], "fleet_managed")
             self.assertNotIn("target/release", payload.decode())
+
+    def test_schema_v2_renders_gateway_policy_surface(self) -> None:
+        host = {
+            "schema_version": 2,
+            "host_id": "test-host",
+            "workspace_root": "/work",
+            "source_root": "/work/mcp-server",
+            "bin_root": "/work/mcp-server/bin",
+            "runtime_root": "/work/mcp-server/runtime",
+            "gateway": {"server_dir": "gateway/servers.d", "policy_file": "gateway/gateway.yaml"},
+            "servers": {"filesystem": {}, "git": {}, "exec": {}},
+        }
+        fleet = {"components": {
+            "filesystem": {"binary": "rust-mcp-filesystem"},
+            "git": {"binary": "rust-mcp-git"},
+            "exec": {"binary": "rust-mcp-exec"},
+        }}
+        plan = fleetctl.render_plan_data(host, fleet)
+        policy = next(item for item in plan["outputs"] if item["surface"] == "gateway.policy")
+        self.assertEqual(policy["relative_path"], "gateway/gateway.yaml")
+        self.assertIn("schema_version: 1", base64.b64decode(policy["content_b64"]).decode())
+
+    def test_schema_v2_policy_rejects_unknown_active_profile(self) -> None:
+        host = {
+            "schema_version": 2,
+            "runtime_root": "/work/runtime",
+            "gateway": {"policy": {"active_profile": "missing", "profiles": ["develop"]}},
+        }
+        with self.assertRaises(RuntimeError):
+            fleetctl.gateway_policy_text(host)
 
     def test_self_update_tree_fingerprint_is_deterministic_and_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:

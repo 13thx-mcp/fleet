@@ -102,6 +102,21 @@ def binary_version(binary: Path) -> str | None:
     return ".".join(str(part) for part in parsed) if parsed else None
 
 
+def tunnel_binary_identity(binary: Path, role: str) -> tuple[str, str]:
+    if not binary.is_file():
+        raise RuntimeError(f"missing staged {role} tunnel binary")
+    code, out, _ = run([str(binary), "--version"], binary.parent)
+    if code != 0:
+        raise RuntimeError(f"cannot query staged {role} tunnel binary version")
+    if role == "runtime":
+        match = re.search(r"^(\d+\.\d+\.\d+) git sha: ([0-9a-f]{7,64})\b", out)
+    else:
+        match = re.search(r"^(\d+\.\d+\.\d+)\+([0-9a-f]{7,64})\b", out)
+    if not match:
+        raise RuntimeError(f"staged {role} tunnel binary identity is invalid")
+    return match.group(1), match.group(2)
+
+
 def bundle_info(path: Path, component: dict[str, Any]) -> dict[str, Any]:
     current = path / "current"
     binary = (current / component["binary"]) if current.exists() else (path / component["binary"])
@@ -166,6 +181,17 @@ def release_assets(release: dict[str, Any]) -> dict[str, str]:
     return {asset["name"]: asset["browser_download_url"] for asset in release.get("assets", [])}
 
 
+def select_tunnel_release_assets(
+    assets: dict[str, str], version: str, target_os: str, target_arch: str, runtime_prefix: str
+) -> tuple[str, str]:
+    runtime_name = f"{runtime_prefix}-v{version}-{target_os}-{target_arch}.zip"
+    full_name = f"tunnel-client-v{version}-{target_os}-{target_arch}.zip"
+    for name in (runtime_name, full_name):
+        if name not in assets:
+            raise RuntimeError(f"official release has no asset {name}")
+    return runtime_name, full_name
+
+
 def expected_checksum(checksums: str, filename: str) -> str:
     for line in checksums.splitlines():
         parts = line.strip().split()
@@ -192,10 +218,10 @@ def tunnel_release_state(host_name: str) -> dict[str, Any]:
     tag = release["tag_name"]
     latest_version = tag.removeprefix("v")
     target_os, target_arch = host_platform()
-    asset_name = f"{component['asset_prefix']}-v{latest_version}-{target_os}-{target_arch}.zip"
     assets = release_assets(release)
-    if asset_name not in assets:
-        raise RuntimeError(f"official release {tag} has no asset {asset_name}")
+    asset_name, full_asset_name = select_tunnel_release_assets(
+        assets, latest_version, target_os, target_arch, component["asset_prefix"]
+    )
     if "SHA256SUMS.txt" not in assets:
         raise RuntimeError(f"official release {tag} has no SHA256SUMS.txt")
     current_version = info.get("version")
@@ -211,6 +237,8 @@ def tunnel_release_state(host_name: str) -> dict[str, Any]:
         "latest_tag": tag,
         "asset_name": asset_name,
         "asset_url": assets[asset_name],
+        "full_asset_name": full_asset_name,
+        "full_asset_url": assets[full_asset_name],
         "checksums_url": assets["SHA256SUMS.txt"],
         "up_to_date": current_semver is not None and latest_semver == current_semver,
         "update_available": current_semver is None or (latest_semver is not None and latest_semver > current_semver),
@@ -220,7 +248,7 @@ def tunnel_release_state(host_name: str) -> dict[str, Any]:
 def tunnel_check(host_name: str) -> int:
     state = tunnel_release_state(host_name)
     print(f"host={host_name} os={state['os']} arch={state['arch']}")
-    print(f"installed={state['current_version'] or '-'} latest={state['latest_version']} asset={state['asset_name']}")
+    print(f"installed={state['current_version'] or '-'} latest={state['latest_version']} runtime={state['asset_name']} full={state['full_asset_name']}")
     print("status=up-to-date" if state["up_to_date"] else "status=update-available")
     return 0
 
@@ -252,31 +280,44 @@ def tunnel_update(host_name: str, force: bool) -> int:
     with tempfile.TemporaryDirectory(prefix="tunnel-client-update-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         archive = temp_dir / state["asset_name"]
+        full_archive = temp_dir / state["full_asset_name"]
         archive.write_bytes(http_bytes(state["asset_url"]))
+        full_archive.write_bytes(http_bytes(state["full_asset_url"]))
         checksum_text = http_bytes(state["checksums_url"]).decode("utf-8")
-        expected = expected_checksum(checksum_text, state["asset_name"])
-        actual = sha256_file(archive)
-        if actual != expected:
-            raise RuntimeError(f"checksum mismatch for {state['asset_name']}: expected {expected}, got {actual}")
+        for name, candidate in ((state["asset_name"], archive), (state["full_asset_name"], full_archive)):
+            expected = expected_checksum(checksum_text, name)
+            actual = sha256_file(candidate)
+            if actual != expected:
+                raise RuntimeError(f"checksum mismatch for {name}: expected {expected}, got {actual}")
 
         extracted = temp_dir / "extracted"
+        full_extracted = temp_dir / "full-extracted"
         extracted.mkdir()
+        full_extracted.mkdir()
         safe_extract_zip(archive, extracted)
+        safe_extract_zip(full_archive, full_extracted)
         staged_binary = extracted / state["component"]["binary"]
+        staged_full_binary = full_extracted / "tunnel-client"
         for executable_name in (state["component"]["binary"], "cloudflared"):
             executable = extracted / executable_name
             if executable.is_file():
                 executable.chmod(executable.stat().st_mode | 0o111)
-        staged_version = binary_version(staged_binary)
-        if staged_version != state["latest_version"]:
+        staged_full_binary.chmod(staged_full_binary.stat().st_mode | 0o111)
+        runtime_version, runtime_commit = tunnel_binary_identity(staged_binary, "runtime")
+        full_version, full_commit = tunnel_binary_identity(staged_full_binary, "full")
+        if runtime_version != state["latest_version"] or full_version != state["latest_version"]:
             raise RuntimeError(
-                f"release binary version mismatch: expected {state['latest_version']}, got {staged_version or 'unknown'}"
+                f"release binary version mismatch: expected {state['latest_version']}, got runtime={runtime_version} full={full_version}"
             )
+        if runtime_commit != full_commit:
+            raise RuntimeError("full and runtime tunnel artifacts have different release commits")
 
         staged_dir = releases_dir / f".v{state['latest_version']}.{os.getpid()}.tmp"
         if staged_dir.exists():
             shutil.rmtree(staged_dir)
         shutil.copytree(extracted, staged_dir)
+        shutil.copy2(staged_full_binary, staged_dir / "tunnel-client")
+        (staged_dir / "tunnel-client").chmod(staged_full_binary.stat().st_mode)
         for executable_name in (state["component"]["binary"], "cloudflared"):
             executable = staged_dir / executable_name
             if executable.is_file():
@@ -404,6 +445,67 @@ def yaml_string(value: str) -> str:
     return json.dumps(value)
 
 
+def gateway_policy_text(host: dict[str, Any]) -> str | None:
+    if int(host.get("schema_version", 1)) < 2:
+        return None
+    policy = host.get("gateway", {}).get("policy", {})
+    profiles = policy.get("profiles", ["inspect", "develop", "release", "ops", "hardware"])
+    if not isinstance(profiles, list) or not profiles or any(not isinstance(name, str) or not name for name in profiles):
+        raise RuntimeError("gateway.policy.profiles must be a non-empty string list")
+    active_profile = policy.get("active_profile", "develop")
+    if active_profile not in profiles:
+        raise RuntimeError("gateway.policy.active_profile must be declared")
+    limits = {
+        "global_active": int(policy.get("global_active", 16)),
+        "global_queue": int(policy.get("global_queue", 64)),
+        "queue_wait_ms": int(policy.get("queue_wait_ms", 30000)),
+        "default_child_active": int(policy.get("default_child_active", 4)),
+    }
+    if any(value <= 0 for value in limits.values()):
+        raise RuntimeError("gateway.policy limits must be positive")
+    drain_deadline_ms = int(policy.get("drain_deadline_ms", 60000))
+    if drain_deadline_ms <= 0:
+        raise RuntimeError("gateway.policy.drain_deadline_ms must be positive")
+    lines = [
+        "schema_version: 1",
+        f"active_profile: {yaml_string(active_profile)}",
+        "limits:",
+        *(f"  {key}: {value}" for key, value in limits.items()),
+        "tool_class_defaults:",
+        "  read: {concurrency: 4}",
+        "  mutation: {concurrency: 1}",
+        "  long-running: {concurrency: 1}",
+        "  control: {concurrency: 1}",
+        "drain:",
+        f"  deadline_ms: {drain_deadline_ms}",
+        f"  allow_safe_reads: {'true' if policy.get('allow_safe_reads', False) else 'false'}",
+        "payload:",
+        "  request_bytes: 1048576",
+        "  response_bytes: 2097152",
+        "  text_preview_bytes: 65536",
+        "  structured_bytes: 1048576",
+        "  binary_bytes: 1048576",
+        "artifacts:",
+        "  enabled: true",
+        "  ttl_seconds: 900",
+        "  max_item_bytes: 8388608",
+        "  max_total_bytes: 67108864",
+        "profiles:",
+        *(f"  {name}: {{}}" for name in sorted(profiles)),
+        "children: {}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def gateway_policy_path(host: dict[str, Any]) -> Path:
+    runtime_root = Path(host["runtime_root"]).resolve()
+    relative = Path(host.get("gateway", {}).get("policy_file", "gateway/gateway.yaml"))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError("gateway.policy_file must be runtime-root relative")
+    return (runtime_root / relative).resolve()
+
+
 def render_server(name: str, server: dict[str, Any], host: dict[str, Any], fleet: dict[str, Any]) -> str:
     component = fleet["components"][name]
     command = Path(host["bin_root"]) / component["binary"]
@@ -441,6 +543,9 @@ def gateway_outputs(host_name: str) -> dict[Path, str]:
     outputs: dict[Path, str] = {}
     for name in ("filesystem", "git", "exec"):
         outputs[server_dir / f"{name}.yaml"] = render_server(name, host["servers"][name], host, fleet)
+    policy = gateway_policy_text(host)
+    if policy is not None:
+        outputs[gateway_policy_path(host)] = policy
     return outputs
 
 
@@ -473,6 +578,10 @@ def render_plan_data(host: dict[str, Any], fleet: dict[str, Any]) -> dict[str, A
             render_server(name, host["servers"][name], host, fleet),
             ["gateway_reload"],
         )
+
+    policy = gateway_policy_text(host)
+    if policy is not None:
+        add("gateway.policy", gateway_policy_path(host), policy, ["gateway_reload"])
 
     add(
         "studio.config",
