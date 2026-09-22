@@ -5,6 +5,9 @@ source_root = "/Users/xiivth/workspaces/signs/mcp-server"
 bin_root = "/Users/xiivth/workspaces/signs/mcp-server/bin"
 runtime_root = "/Users/xiivth/workspaces/signs/mcp-server/runtime"
 
+[tunnel]
+tunnel_id = "tunnel_6aaa078723508191a0a0e9a43f68e84e"
+
 [gateway]
 server_dir = "gateway/servers.d"
 policy_file = "gateway/gateway.yaml"

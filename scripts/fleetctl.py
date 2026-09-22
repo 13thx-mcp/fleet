@@ -22,6 +22,7 @@ from typing import Any
 
 FLEET_DIR = Path(__file__).resolve().parents[1]
 FLEET_CONFIG = FLEET_DIR / "fleet.toml"
+TUNNEL_ID_RE = re.compile(r"^tunnel_[0-9a-f]{32}$")
 
 
 def load_toml(path: Path) -> dict[str, Any]:
@@ -730,9 +731,15 @@ def tunnel_config_text(host: dict[str, Any]) -> str:
     runtime_root = Path(host["runtime_root"]).resolve()
     gateway = bin_root / "rust-mcp-gateway"
     server_dir = runtime_root / "gateway" / "servers.d"
+
+    tunnel = host.get("tunnel", {})
+    tunnel_id = tunnel.get("tunnel_id") if isinstance(tunnel, dict) else None
+    if not isinstance(tunnel_id, str) or not TUNNEL_ID_RE.fullmatch(tunnel_id):
+        raise RuntimeError("invalid or missing tunnel.tunnel_id")
+
     lines = [
         "config_version: 1", "",
-        "control_plane:", "  base_url: \"https://api.openai.com\"", "  poll_channels:", "    - main", "",
+        "control_plane:", f"  tunnel_id: {yaml_string(tunnel_id)}", "  base_url: \"https://api.openai.com\"", "  poll_channels:", "    - main", "",
         "health:", "  listen_addr: \"127.0.0.1:18080\"", "",
         "admin_ui:", "  open_browser: false", "",
         "log:", "  level: \"info\"", "  format: \"struct-text\"", "",
