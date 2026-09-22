@@ -23,11 +23,34 @@ from typing import Any
 FLEET_DIR = Path(__file__).resolve().parents[1]
 FLEET_CONFIG = FLEET_DIR / "fleet.toml"
 TUNNEL_ID_RE = re.compile(r"^tunnel_[0-9a-f]{32}$")
+HOST_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 def load_toml(path: Path) -> dict[str, Any]:
     with path.open("rb") as handle:
         return tomllib.load(handle)
+
+
+def runtime_fleet_dir() -> Path:
+    if FLEET_DIR.parent.name == "runtime":
+        return FLEET_DIR
+    return FLEET_DIR.parent / "runtime" / "fleet"
+
+
+def host_profile_path(host_name: str) -> Path:
+    if not HOST_NAME_RE.fullmatch(host_name):
+        raise RuntimeError("host name must contain only letters, digits, hyphens, or underscores")
+    hosts_dir = (runtime_fleet_dir() / "hosts").resolve()
+    profile = (hosts_dir / f"{host_name}.toml").resolve()
+    try:
+        profile.relative_to(hosts_dir)
+    except ValueError as exc:
+        raise RuntimeError("host profile escapes runtime fleet hosts directory") from exc
+    return profile
+
+
+def load_host_profile(host_name: str) -> dict[str, Any]:
+    return load_toml(host_profile_path(host_name))
 
 
 def run(argv: list[str], cwd: Path) -> tuple[int, str, str]:
@@ -211,7 +234,7 @@ def sha256_file(path: Path) -> str:
 
 def tunnel_release_state(host_name: str) -> dict[str, Any]:
     fleet = load_toml(FLEET_CONFIG)
-    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    host = load_host_profile(host_name)
     component = fleet["components"]["tunnel-client"]
     install_dir = Path(host["runtime_root"]).resolve() / component.get("install_dir", "tunnel-client")
     info = bundle_info(install_dir, component) if install_dir.is_dir() else {"version": None}
@@ -342,8 +365,7 @@ def tunnel_update(host_name: str, force: bool) -> int:
 
 def collect(host_name: str) -> dict[str, Any]:
     fleet = load_toml(FLEET_CONFIG)
-    host_path = FLEET_DIR / "hosts" / f"{host_name}.toml"
-    host = load_toml(host_path)
+    host = load_host_profile(host_name)
     bin_root = Path(host["bin_root"]).resolve()
     runtime_root = Path(host["runtime_root"]).resolve()
     components: dict[str, Any] = {}
@@ -539,7 +561,7 @@ def render_server(name: str, server: dict[str, Any], host: dict[str, Any], fleet
 
 def gateway_outputs(host_name: str) -> dict[Path, str]:
     fleet = load_toml(FLEET_CONFIG)
-    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    host = load_host_profile(host_name)
     server_dir = (Path(host["runtime_root"]) / host["gateway"]["server_dir"]).resolve()
     outputs: dict[Path, str] = {}
     for name in ("filesystem", "git", "exec"):
@@ -610,7 +632,7 @@ def render_plan(host_name: str, json_output: bool) -> int:
     if not json_output:
         raise RuntimeError("render-plan currently requires --json")
     fleet = load_toml(FLEET_CONFIG)
-    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    host = load_host_profile(host_name)
     print(json.dumps(render_plan_data(host, fleet), sort_keys=True, separators=(",", ":")))
     return 0
 
@@ -725,7 +747,7 @@ def studio_config_text(host: dict[str, Any]) -> str:
 
 
 def render_studio(host_name: str, check: bool) -> int:
-    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    host = load_host_profile(host_name)
     output = Path(host["runtime_root"]).resolve() / "studio" / "studio.toml"
     desired = studio_config_text(host)
     current = output.read_text() if output.is_file() else None
@@ -775,7 +797,7 @@ def tunnel_config_text(host: dict[str, Any]) -> str:
 
 
 def render_tunnel_config(host_name: str, check: bool) -> int:
-    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    host = load_host_profile(host_name)
     output = Path(host["runtime_root"]).resolve() / "tunnel-client" / "config.yaml"
     desired = tunnel_config_text(host)
     current = output.read_text() if output.is_file() else None
@@ -801,19 +823,20 @@ def render_tunnel_config(host_name: str, check: bool) -> int:
 
 
 def deploy_control(host_name: str) -> int:
-    host_path = FLEET_DIR / "hosts" / f"{host_name}.toml"
-    host = load_toml(host_path)
+    host = load_host_profile(host_name)
     destination = Path(host["runtime_root"]).resolve() / "fleet"
+    if destination.resolve() != runtime_fleet_dir().resolve():
+        raise RuntimeError("active host profile must be owned by runtime/fleet/hosts")
     (destination / "scripts").mkdir(parents=True, exist_ok=True)
     (destination / "hosts").mkdir(parents=True, exist_ok=True)
     copies = [
         (FLEET_CONFIG, destination / "fleet.toml"),
         (Path(__file__).resolve(), destination / "scripts" / "fleetctl.py"),
-        (host_path, destination / "hosts" / host_path.name),
         (FLEET_DIR / "README.md", destination / "README.md"),
     ]
     for source, target in copies:
-        shutil.copy2(source, target)
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
     (destination / "scripts" / "fleetctl.py").chmod(0o755)
     print(f"DEPLOYED: fleet control -> {destination}")
     return 0
@@ -821,7 +844,7 @@ def deploy_control(host_name: str) -> int:
 
 def install_component(host_name: str, component_name: str) -> int:
     fleet = load_toml(FLEET_CONFIG)
-    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    host = load_host_profile(host_name)
     component = fleet.get("components", {}).get(component_name)
     if component is None:
         print(f"fleetctl: unknown component {component_name}", file=sys.stderr)
@@ -1232,7 +1255,7 @@ def rollback_studio_release(
 
 
 def studio_activate(host_name: str, transaction_id: str, parent_pid: int) -> int:
-    host = load_toml(FLEET_DIR / "hosts" / f"{host_name}.toml")
+    host = load_host_profile(host_name)
     runtime_root = Path(host["runtime_root"]).resolve()
     studio_root = runtime_root / "studio"
     metadata_path = self_update_transaction_path(host, transaction_id)
