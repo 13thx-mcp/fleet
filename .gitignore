@@ -2,3 +2,5 @@ state/
 __pycache__/
 *.pyc
 .DS_Store
+hosts/*.toml
+!hosts/*.example.toml

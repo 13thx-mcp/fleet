@@ -1,0 +1,20 @@
+# Source example only. Copy to runtime/fleet/hosts/<host>.toml and replace values locally.
+schema_version = 2
+host_id = "example"
+workspace_root = "/path/to/workspace"
+source_root = "/path/to/workspace/mcp-server"
+bin_root = "/path/to/workspace/mcp-server/bin"
+runtime_root = "/path/to/workspace/mcp-server/runtime"
+
+[tunnel]
+tunnel_id = "tunnel_0123456789abcdef0123456789abcdef"
+control_plane_api_key_file = "/path/to/runtime/tunnel-client/credentials/control-plane-api-key"
+
+[gateway]
+server_dir = "gateway/servers.d"
+
+[servers.filesystem]
+
+[servers.git]
+
+[servers.exec]

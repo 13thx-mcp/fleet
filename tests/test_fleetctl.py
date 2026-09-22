@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import io
+import json
 import os
 import tempfile
 import unittest
@@ -16,8 +18,132 @@ assert SPEC and SPEC.loader
 fleetctl = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fleetctl)
 
+HYGIENE_MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "check_source_hygiene.py"
+HYGIENE_SPEC = importlib.util.spec_from_file_location("check_source_hygiene", HYGIENE_MODULE_PATH)
+assert HYGIENE_SPEC and HYGIENE_SPEC.loader
+source_hygiene = importlib.util.module_from_spec(HYGIENE_SPEC)
+HYGIENE_SPEC.loader.exec_module(source_hygiene)
+
 
 class FleetCtlTests(unittest.TestCase):
+    def test_source_hygiene_rejects_host_metadata_and_tunnel_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            source = root / "hosts/unsafe.toml"
+            source.parent.mkdir()
+            machine_path = "/" + "Users" + "/fixture/workspace"
+            source.write_text(
+                f'workspace_root = "{machine_path}"\n'
+                'tunnel_id = "tunnel_0123456789abcdef0123456789abcdef"\n'
+            )
+            self.assertEqual(
+                source_hygiene.violations_for(source, root),
+                ["machine-specific host path", "tunnel identity outside test/example"],
+            )
+
+    def test_runtime_host_profile_is_authority_without_source_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            fleet_root = root / "fleet"
+            runtime_hosts = root / "runtime/fleet/hosts"
+            (fleet_root / "hosts").mkdir(parents=True)
+            runtime_hosts.mkdir(parents=True)
+            (fleet_root / "hosts/aira.example.toml").write_text('host_id = "example"\n')
+            (runtime_hosts / "aira.example.toml").write_text('host_id = "example"\n')
+            (runtime_hosts / "aira.toml").write_text('host_id = "runtime-authority"\n')
+
+            original_fleet_dir = fleetctl.FLEET_DIR
+            try:
+                fleetctl.FLEET_DIR = fleet_root
+                self.assertEqual(fleetctl.host_profile_path("aira"), (runtime_hosts / "aira.toml").resolve())
+                self.assertEqual(fleetctl.load_host_profile("aira")["host_id"], "runtime-authority")
+                with self.assertRaises(RuntimeError):
+                    fleetctl.host_profile_path("../aira")
+            finally:
+                fleetctl.FLEET_DIR = original_fleet_dir
+
+    def test_render_plan_works_without_source_host_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            fleet_root = root / "fleet"
+            runtime_hosts = root / "runtime/fleet/hosts"
+            fleet_root.mkdir()
+            runtime_hosts.mkdir(parents=True)
+            (fleet_root / "fleet.toml").write_text(
+                """
+[components.filesystem]
+binary = "rust-mcp-filesystem"
+[components.git]
+binary = "rust-mcp-git"
+[components.exec]
+binary = "rust-mcp-exec"
+"""
+            )
+            (runtime_hosts / "aira.toml").write_text(
+                """
+schema_version = 2
+host_id = "runtime-authority"
+workspace_root = "/work"
+source_root = "/work/mcp-server"
+bin_root = "/work/mcp-server/bin"
+runtime_root = "/work/mcp-server/runtime"
+
+[tunnel]
+tunnel_id = "tunnel_0123456789abcdef0123456789abcdef"
+control_plane_api_key_file = "/runtime/tunnel-client/credentials/control-plane-api-key"
+
+[gateway]
+server_dir = "gateway/servers.d"
+
+[servers.filesystem]
+[servers.git]
+[servers.exec]
+"""
+            )
+
+            original_fleet_dir = fleetctl.FLEET_DIR
+            original_fleet_config = fleetctl.FLEET_CONFIG
+            try:
+                fleetctl.FLEET_DIR = fleet_root
+                fleetctl.FLEET_CONFIG = fleet_root / "fleet.toml"
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                    self.assertEqual(fleetctl.render_plan("aira", True), 0)
+                plan = json.loads(output.getvalue())
+                self.assertEqual(plan["host_id"], "runtime-authority")
+                self.assertEqual(plan["runtime_root"], "/work/mcp-server/runtime")
+            finally:
+                fleetctl.FLEET_DIR = original_fleet_dir
+                fleetctl.FLEET_CONFIG = original_fleet_config
+
+    def test_deploy_control_preserves_runtime_host_profile_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            fleet_root = root / "fleet"
+            runtime_root = root / "runtime"
+            runtime_host = runtime_root / "fleet/hosts/aira.toml"
+            fleet_root.mkdir()
+            runtime_host.parent.mkdir(parents=True)
+            (fleet_root / "fleet.toml").write_text('fleet_name = "test"\n')
+            (fleet_root / "README.md").write_text("test fleet\n")
+            runtime_host.write_text(
+                f'host_id = "aira"\nruntime_root = "{runtime_root}"\n'
+            )
+            original_bytes = runtime_host.read_bytes()
+
+            original_fleet_dir = fleetctl.FLEET_DIR
+            original_fleet_config = fleetctl.FLEET_CONFIG
+            try:
+                fleetctl.FLEET_DIR = fleet_root
+                fleetctl.FLEET_CONFIG = fleet_root / "fleet.toml"
+                self.assertEqual(fleetctl.deploy_control("aira"), 0)
+                self.assertEqual(fleetctl.deploy_control("aira"), 0)
+                self.assertEqual(runtime_host.read_bytes(), original_bytes)
+                self.assertTrue((runtime_root / "fleet/scripts/fleetctl.py").is_file())
+                self.assertTrue((runtime_root / "fleet/README.md").is_file())
+            finally:
+                fleetctl.FLEET_DIR = original_fleet_dir
+                fleetctl.FLEET_CONFIG = original_fleet_config
+
     def test_normalize_platform(self) -> None:
         self.assertEqual(fleetctl.normalize_platform("Darwin", "x86_64"), ("darwin", "amd64"))
         self.assertEqual(fleetctl.normalize_platform("Darwin", "arm64"), ("darwin", "arm64"))
@@ -286,7 +412,7 @@ class FleetCtlTests(unittest.TestCase):
         fleet_root = root / "fleet"
         runtime_root = root / "runtime"
         studio_root = runtime_root / "studio"
-        (fleet_root / "hosts").mkdir(parents=True)
+        (runtime_root / "fleet/hosts").mkdir(parents=True)
         (studio_root / "data/self-update").mkdir(parents=True)
         (studio_root / "releases").mkdir(parents=True)
         (studio_root / "studio.toml").write_text(
@@ -295,7 +421,7 @@ class FleetCtlTests(unittest.TestCase):
         (studio_root / "mcp-studio").write_bytes(b"old")
 
         host = "test"
-        (fleet_root / "hosts" / f"{host}.toml").write_text(
+        (runtime_root / "fleet/hosts" / f"{host}.toml").write_text(
             f'host_id = "{host}"\nruntime_root = "{runtime_root}"\n'
         )
         tx = "txn-studio-test"
@@ -488,9 +614,10 @@ class FleetCtlTests(unittest.TestCase):
             source_root = root / "source"
             runtime_root = root / "runtime"
             bin_root = root / "bin"
-            (fleet_root / "hosts").mkdir(parents=True)
+            fleet_root.mkdir()
+            (runtime_root / "fleet/hosts").mkdir(parents=True)
             (source_root / "studio/target/release").mkdir(parents=True)
-            runtime_root.mkdir()
+            runtime_root.mkdir(exist_ok=True)
             bin_root.mkdir()
             source_binary = source_root / "studio/target/release/mcp-studio"
             source_binary.write_bytes(b"studio")
@@ -509,7 +636,7 @@ build_output = "target/release/mcp-studio"
 binary = "mcp-studio"
 """
             )
-            (fleet_root / "hosts/test.toml").write_text(
+            (runtime_root / "fleet/hosts/test.toml").write_text(
                 f"""
 source_root = "{source_root}"
 runtime_root = "{runtime_root}"
