@@ -42,7 +42,7 @@ jobs:
           mkdir -p "dist/$name/hosts" "dist/$name/scripts"
           cp VERSION fleet.toml README.md "dist/$name/"
           cp scripts/fleetctl.py "dist/$name/scripts/"
-          cp hosts/mirin.example.toml "dist/$name/hosts/"
+          cp hosts/host.example.toml "dist/$name/hosts/"
           chmod 0755 "dist/$name/scripts/fleetctl.py"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > SHA256SUMS.txt)
